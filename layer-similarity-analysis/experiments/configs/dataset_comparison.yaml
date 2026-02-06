@@ -1,0 +1,27 @@
+# Dataset Comparison
+# Analyze how dataset affects layer similarity
+
+experiments:
+  - name: bert_c4
+    model: bert-base-uncased
+    pooling: mean
+    dataset: c4
+    num_samples: 20000
+
+  - name: bert_banking77
+    model: bert-base-uncased
+    pooling: mean
+    dataset: Banking77Classification
+    num_samples: 10000
+
+  - name: bert_imdb
+    model: bert-base-uncased
+    pooling: mean
+    dataset: ImdbClassification
+    num_samples: 10000
+
+  - name: bert_emotion
+    model: bert-base-uncased
+    pooling: mean
+    dataset: EmotionClassification
+    num_samples: 10000

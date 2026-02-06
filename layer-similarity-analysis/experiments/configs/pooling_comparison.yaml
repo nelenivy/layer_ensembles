@@ -1,0 +1,33 @@
+# Pooling Strategy Comparison
+# Compare different pooling methods on BERT
+
+experiments:
+  - name: bert_mean
+    model: bert-base-uncased
+    pooling: mean
+    dataset: c4
+    num_samples: 20000
+
+  - name: bert_cls
+    model: bert-base-uncased
+    pooling: cls
+    dataset: c4
+    num_samples: 20000
+
+  - name: bert_max
+    model: bert-base-uncased
+    pooling: max
+    dataset: c4
+    num_samples: 20000
+
+  - name: bert_last_token
+    model: bert-base-uncased
+    pooling: last_token
+    dataset: c4
+    num_samples: 20000
+
+  - name: bert_pooler
+    model: bert-base-uncased
+    pooling: pooler
+    dataset: c4
+    num_samples: 20000

@@ -1,0 +1,72 @@
+# Default Configuration for Layer Aggregation Project
+
+# Model settings
+model:
+  name: "bert-base-uncased"
+  pooling: "mean"  # Options: mean, cls, last_token
+  device: "cuda"  # Options: cuda, cpu, mps
+  batch_size: 32
+
+# Similarity metrics
+similarity:
+  metrics: ["CKA", "RSA", "correlation", "cosine"]
+
+# Data settings
+data:
+  pca_samples: 10000  # Number of C4 samples for PCA
+  dataset: "c4"  # Dataset for similarity computation
+  max_length: 512  # Max sequence length
+
+# Aggregation settings
+aggregation:
+  method: "weighted_sum"  # Options: weighted_sum, learned_projection, attention
+  normalize_weights: true
+  use_layer_quality: true
+
+# Optimization settings (for learned methods)
+optimization:
+  learning_rate: 0.001
+  epochs: 100
+  early_stopping: true
+  patience: 10
+  validation_split: 0.2
+
+# PCA settings
+pca:
+  n_components: 768  # Should match model embedding dimension
+  whiten: false
+  random_state: 42
+
+# Grid search settings
+grid_search:
+  enabled: false
+  models:
+    - "bert-base-uncased"
+    - "roberta-base"
+  pooling_methods:
+    - "mean"
+    - "cls"
+  datasets:
+    - "c4"
+  similarity_metrics:
+    - "CKA"
+    - "RSA"
+    - "correlation"
+
+# Evaluation settings
+evaluation:
+  tasks: null  # null means all MTEB tasks
+  categories: ["Classification", "Retrieval", "STS"]  # Or specify categories
+  output_folder: "./results"
+
+# Logging
+logging:
+  level: "INFO"  # Options: DEBUG, INFO, WARNING, ERROR
+  log_file: "experiment.log"
+
+# Output paths
+paths:
+  output_dir: "./output"
+  checkpoint_dir: "./checkpoints"
+  similarity_matrices: "./similarity_matrices"
+  results_dir: "./results"

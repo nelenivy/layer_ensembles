@@ -1,0 +1,27 @@
+# Model Comparison Experiment
+# Compare different transformer architectures
+
+experiments:
+  - name: bert_base
+    model: bert-base-uncased
+    pooling: mean
+    dataset: c4
+    num_samples: 20000
+
+  - name: roberta_base
+    model: roberta-base
+    pooling: mean
+    dataset: c4
+    num_samples: 20000
+
+  - name: albert_base
+    model: albert-base-v2
+    pooling: mean
+    dataset: c4
+    num_samples: 20000
+
+  - name: distilbert
+    model: distilbert-base-uncased
+    pooling: mean
+    dataset: c4
+    num_samples: 20000
