@@ -1,3 +1,6 @@
+# layer_ensembles
+A repo for R&amp;D of methods for construction of ensembles of embeddings
+
 ## Pipeline
 
 ### Install layer similarity calculation
@@ -27,3 +30,4 @@ pip install -e .
 ```bash
 python scripts/run_mteb_eval.py     --model-name bert-base-uncased     --similarity-matrix /home/jovyan/shestov/layer-similarity-analysis/results/grid/bert_base_uncased_mean_c4/similarities/CKA.pkl     --tasks all   --task-types Classification     --lambda-values 0.1 0.5 1.0  --methods weighted greedy cluster greedyv2      --output-dir ./aggregation_results16 --max-samples 10000 --batch-size 512
 ```
+
