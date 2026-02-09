@@ -27,13 +27,13 @@ import mteb
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.models.aggregated_encoder import AggregatedEncoder
-from src.models.pca_encoders import (
+from src.aggregated_encoder import AggregatedEncoder
+from src.pca_encoders import (
     SelectedLayersPCAEncoder,
     ClusterPCAEncoder,
     AllLayersPCAEncoder
 )
-from src.aggregation.strategies import (
+from src.strategies import (
     compute_similarity_weights,
     compute_greedy_weights,
     compute_greedy_weights_v2,
