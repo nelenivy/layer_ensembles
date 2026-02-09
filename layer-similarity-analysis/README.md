@@ -60,6 +60,9 @@ pip install -r requirements.txt
 
 ### Run Your First Analysis
 
+python scripts/run_grid_search.py     --models bert-base-uncased roberta-base princeton-nlp/sup-simcse-roberta-base     --pooling mean cls last_token     --datasets c4     --output-dir ./results/grid
+
+# NEUROSLOP
 ```bash
 # Quick test (< 5 minutes)
 python scripts/run_pipeline.py \
