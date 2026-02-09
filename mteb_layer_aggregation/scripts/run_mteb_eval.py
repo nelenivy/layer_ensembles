@@ -26,7 +26,7 @@ import mteb
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
-
+from src.one_layer_eval import compute_dataset_specific_layer_quality
 from src.aggregated_encoder import AggregatedEncoder
 from src.pca_encoders import (
     SelectedLayersPCAEncoder,
@@ -568,11 +568,12 @@ def run_evaluation(
     pooling: str = "mean",
     num_clusters: int = 4,
     overwrite_results: bool = False,
-    max_samples: Optional[int] = None
+    max_samples: Optional[int] = None,
+    dataset_specific_task: Optional[str] = None  # ADD THIS LINE
 ):
+
     """Run MTEB evaluation for all method/lambda combinations."""
     similarity_matrix = load_similarity_matrix(similarity_matrix_path)
-    layer_quality = compute_layer_quality(similarity_matrix, method="diagonal")
     os.makedirs(output_dir, exist_ok=True)
 
     logger.info("Loading MTEB tasks...")
@@ -603,18 +604,6 @@ def run_evaluation(
             logger.info("=" * 70)
 
             try:
-                encoder = create_aggregated_encoder(
-                    model_name=model_name,
-                    similarity_matrix=similarity_matrix,
-                    method=method,
-                    layer_quality=layer_quality,
-                    lmbd=lmbd,
-                    batch_size=batch_size,
-                    pca_cache_dir=pca_cache_dir,
-                    pooling=pooling,
-                    num_clusters=num_clusters
-                )
-
                 config_results = {
                     'method': method,
                     'lambda': lmbd,
@@ -631,6 +620,30 @@ def run_evaluation(
                             continue
 
                     try:
+                        task_to_use = task_name if (dataset_specific_task is None) else dataset_specific_task
+                        logger.info(f"Computing layer quality on {task_to_use}...")
+                        layer_quality = compute_dataset_specific_layer_quality(
+                            model_name=model_name,
+                            task_name=task_to_use,
+                            split="validation",
+                            pooling=pooling,
+                            batch_size=batch_size,
+                            device="cuda",
+                            verbose=1
+                        )
+                        print(layer_quality)
+                        encoder = create_aggregated_encoder(
+                            model_name=model_name,
+                            similarity_matrix=similarity_matrix,
+                            method=method,
+                            layer_quality=layer_quality,
+                            lmbd=lmbd,
+                            batch_size=batch_size,
+                            pca_cache_dir=pca_cache_dir,
+                            pooling=pooling,
+                            num_clusters=num_clusters
+                        )
+
                         task_result = mteb.evaluate(
                             model=encoder,
                             tasks=[task],
@@ -693,10 +706,12 @@ def main():
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
     parser.add_argument("--pooling", type=str, default="mean", choices=["mean", "cls"], help="Pooling strategy")
     parser.add_argument("--overwrite-results", action="store_true", help="Overwrite cached results")
-
-    # NEW: Filter by dataset size
     parser.add_argument("--max-samples", type=int, default=None, 
                        help="Maximum number of samples per task (for testing on small datasets)")
+    parser.add_argument("--dataset-specific-task", type=str, default=None,
+                       help="MTEB task name to compute layer quality on (e.g., 'Banking77Classification'). "
+                            "If specified, evaluates each layer on this task's validation set (notebook approach). "
+                            "If not specified, evaluates on each task.")
 
     args = parser.parse_args()
 
@@ -713,7 +728,8 @@ def main():
         pooling=args.pooling,
         num_clusters=args.num_clusters,
         overwrite_results=args.overwrite_results,
-        max_samples=args.max_samples
+        max_samples=args.max_samples,
+        dataset_specific_task=args.dataset_specific_task
     )
 
 
