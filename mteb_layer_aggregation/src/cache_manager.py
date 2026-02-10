@@ -8,84 +8,123 @@ from typing import Optional, Dict, Tuple, List
 
 # cache_manager.py - Sentence-level caching
 
-# cache_manager.py - LMDB-based cache (requires: pip install lmdb)
+# cache_manager.py - Robust LMDB implementation
 
 import lmdb
 import numpy as np
 import pickle
+import hashlib
+import shutil
 from pathlib import Path
-from typing import Optional
-import lmdb
+from typing import Optional, List, Dict
+import logging
+import sqlite3
+
+logger = logging.getLogger(__name__)
+
+# cache_manager.py - SQLite version (more robust)
+
 
 class EmbeddingCache:
-    """LMDB-based cache - very fast, memory-mapped"""
+    """SQLite-based cache - more robust than LMDB"""
     
-    def __init__(self, cache_dir: str = "./embedding_cache", map_size=100*1024**3):
-        """
-        Args:
-            cache_dir: Cache directory
-            map_size: Maximum database size (default 100GB)
-        """
+    def __init__(self, cache_dir: str = "./embedding_cache"):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.map_size = map_size
-        self.envs = {}  # One environment per model/layer/pooling
+        self.connections = {}
+        self.memory_cache = {}
+        self.max_memory_items = 10000
     
-    def _get_env(self, model_name: str, layer_idx: int, pooling: str):
-        """Get or create LMDB environment"""
-        safe_name = model_name.replace("/", "_")
-        db_name = f"{safe_name}_L{layer_idx}_{pooling}"
-        
-        if db_name not in self.envs:
-            db_path = self.cache_dir / db_name
-            db_path.mkdir(exist_ok=True)
-            
-            env = lmdb.open(
-                str(db_path),
-                map_size=self.map_size,
-                max_dbs=1,
-                writemap=True,
-                map_async=True,
-                lock=False  # Faster for single-process
-            )
-            self.envs[db_name] = env
-        
-        return self.envs[db_name]
+    def _get_db_path(self, model_name: str, layer_idx: int, pooling: str) -> Path:
+        safe_name = model_name.replace("/", "_").replace("\\", "_")
+        return self.cache_dir / f"{safe_name}_L{layer_idx}_{pooling}.db"
     
-    def _get_key(self, sentence: str) -> bytes:
-        """Generate key for a sentence"""
-        import hashlib
+    def _get_connection(self, model_name: str, layer_idx: int, pooling: str):
+        db_path = self._get_db_path(model_name, layer_idx, pooling)
+        key = str(db_path)
+        
+        if key not in self.connections:
+            try:
+                conn = sqlite3.connect(str(db_path), timeout=30.0, check_same_thread=False)
+                conn.execute('PRAGMA journal_mode=WAL')  # Better concurrency
+                conn.execute('PRAGMA synchronous=NORMAL')  # Faster writes
+                conn.execute('''
+                    CREATE TABLE IF NOT EXISTS embeddings (
+                        sentence_hash TEXT PRIMARY KEY,
+                        embedding BLOB
+                    )
+                ''')
+                conn.execute('CREATE INDEX IF NOT EXISTS idx_hash ON embeddings(sentence_hash)')
+                conn.commit()
+                self.connections[key] = conn
+            except sqlite3.Error as e:
+                logger.error(f"SQLite error: {e}")
+                # Delete corrupted database
+                if db_path.exists():
+                    db_path.unlink()
+                    return self._get_connection(model_name, layer_idx, pooling)
+                raise
+        
+        return self.connections[key]
+    
+    def _get_key(self, sentence: str) -> str:
         normalized = " ".join(sentence.split())
-        return hashlib.md5(normalized.encode()).digest()
+        return hashlib.md5(normalized.encode()).hexdigest()
     
     def get_sentence(self, model_name: str, layer_idx: int, 
                     pooling: str, sentence: str) -> Optional[np.ndarray]:
-        """Get cached embedding"""
-        env = self._get_env(model_name, layer_idx, pooling)
-        key = self._get_key(sentence)
+        mem_key = f"{model_name}_{layer_idx}_{pooling}_{sentence[:50]}"
+        if mem_key in self.memory_cache:
+            return self.memory_cache[mem_key]
         
-        with env.begin() as txn:
-            value = txn.get(key)
-            if value:
-                return pickle.loads(value)
+        try:
+            conn = self._get_connection(model_name, layer_idx, pooling)
+            key = self._get_key(sentence)
+            
+            cursor = conn.execute('SELECT embedding FROM embeddings WHERE sentence_hash = ?', (key,))
+            row = cursor.fetchone()
+            
+            if row:
+                embedding = pickle.loads(row[0])
+                
+                if len(self.memory_cache) >= self.max_memory_items:
+                    self.memory_cache.pop(next(iter(self.memory_cache)))
+                self.memory_cache[mem_key] = embedding
+                
+                return embedding
+        
+        except Exception as e:
+            logger.warning(f"Cache read error: {e}")
         
         return None
     
     def set_sentence(self, model_name: str, layer_idx: int, 
                     pooling: str, sentence: str, embedding: np.ndarray):
-        """Cache embedding"""
-        env = self._get_env(model_name, layer_idx, pooling)
-        key = self._get_key(sentence)
-        value = pickle.dumps(embedding, protocol=pickle.HIGHEST_PROTOCOL)
+        mem_key = f"{model_name}_{layer_idx}_{pooling}_{sentence[:50]}"
+        self.memory_cache[mem_key] = embedding
         
-        with env.begin(write=True) as txn:
-            txn.put(key, value)
+        try:
+            conn = self._get_connection(model_name, layer_idx, pooling)
+            key = self._get_key(sentence)
+            blob = pickle.dumps(embedding, protocol=pickle.HIGHEST_PROTOCOL)
+            
+            conn.execute('''
+                INSERT OR REPLACE INTO embeddings (sentence_hash, embedding)
+                VALUES (?, ?)
+            ''', (key, blob))
+            conn.commit()
+        
+        except Exception as e:
+            logger.warning(f"Cache write error: {e}")
     
     def close(self):
-        """Close all environments"""
-        for env in self.envs.values():
-            env.close()
-        self.envs.clear()
+        for conn in self.connections.values():
+            try:
+                conn.close()
+            except:
+                pass
+        self.connections.clear()
+        self.memory_cache.clear()
 
 
 

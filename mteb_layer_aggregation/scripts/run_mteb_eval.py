@@ -107,7 +107,8 @@ IMAGE_TASK_NAMES = [
 
 CORE_MTEB_TASKS = {
 # Retrieval (4)
-    "NFCorpus", "SciFact", "FiQA2018", "QuoraRetrieval",
+    "NFCorpus", "SciFact", "FiQA2018", 
+    #"QuoraRetrieval",#too big
     # Classification (4)
     "Banking77Classification", "AmazonCounterfactualClassification","EmotionClassification",
     # STS (1)
@@ -115,7 +116,7 @@ CORE_MTEB_TASKS = {
     # Pair Classification (1)
     "SprintDuplicateQuestions",
     # Reranking (1)
-    "MindSmallReranking",
+    #"MindSmallReranking",#too big
     # # Clustering (1)
     # "TwentyNewsgroupsClustering",
     # # Summarization (1)
