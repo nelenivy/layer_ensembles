@@ -107,15 +107,15 @@ IMAGE_TASK_NAMES = [
 
 CORE_MTEB_TASKS = {
 # Retrieval (8)
-    "NFCorpus", "SciFact", "FiQA2018", "QuoraRetrieval",
+    #"NFCorpus", "SciFact", "FiQA2018", "QuoraRetrieval",
     # Classification (4)
     "Banking77Classification", "AmazonCounterfactualClassification","EmotionClassification",
     # STS (2)
-    "STSBenchmark", "SICK-R",
+    #"STSBenchmark", #"SICK-R",
     # Pair Classification (1)
-    "SprintDuplicateQuestions",
+    #"SprintDuplicateQuestions",
     # Reranking (1)
-    "MindSmallReranking",
+    #"MindSmallReranking",
     # # Clustering (1)
     # "TwentyNewsgroupsClustering",
     # # Summarization (1)
@@ -265,19 +265,6 @@ def load_similarity_matrix(path: str) -> np.ndarray:
     return matrix
 
 
-def compute_layer_quality(similarity_matrix: np.ndarray, method: str = "diagonal") -> np.ndarray:
-    """Compute quality score for each layer."""
-    if method == "diagonal":
-        quality = np.diag(similarity_matrix)
-    elif method == "mean":
-        quality = similarity_matrix.mean(axis=1)
-    else:
-        raise ValueError(f"Unknown quality method: {method}")
-
-    quality = np.asarray(quality, dtype=np.float32)
-    return quality
-
-
 def compute_method_weights(
     method: str,
     similarity_matrix: np.ndarray,
@@ -319,7 +306,9 @@ def create_aggregated_encoder(
     batch_size: int = 32,
     pca_cache_dir: str = "./pca_cache",
     pooling: str = "mean",
-    num_clusters: int = 4
+    num_clusters: int = 4,
+    use_cache: bool = False, 
+    cache_dir: str = "./embedding_cache"  
 ):
     """Create encoder with method-specific weights or PCA."""
 
@@ -328,10 +317,11 @@ def create_aggregated_encoder(
 
         encoder = AggregatedEncoder(
             model_name=model_name,
-            similarity_matrix=similarity_matrix,
             pooling=pooling,
             batch_size=batch_size,
-            aggregation_weights=weights
+            aggregation_weights=weights,
+            use_cache=use_cache, 
+            cache_dir=cache_dir   
         )
 
     elif method == "concat+pca+qp":
@@ -449,8 +439,6 @@ def save_intermediate_results(output_dir: str, config_name: str, results: Dict[s
     logger.info(f"Saved intermediate results to {results_path}")
 
 
-
-
 def extract_main_score(task_result: Dict[str, Any], task_name: str) -> float:
     """Extract the main evaluation score from a task result."""
     try:
@@ -488,10 +476,6 @@ def extract_main_score(task_result: Dict[str, Any], task_name: str) -> float:
     except Exception as e:
         logger.debug(f"Could not extract score for {task_name}: {e}")
         return None
-
-
-
-
 
 
 def update_results_tables(output_dir: str, config_name: str, task_name: str, main_score):
@@ -618,7 +602,11 @@ def run_evaluation(
     num_clusters: int = 4,
     overwrite_results: bool = False,
     max_samples: Optional[int] = None,
-    dataset_specific_task: Optional[str] = None  # ADD THIS LINE
+    dataset_specific_task=None,
+    use_embedding_cache=True,
+        use_quality_cache=True,
+        embedding_cache_dir='./embedding_cache',
+        quality_cache_dir='./quality_cache'
 ):
 
     """Run MTEB evaluation for all method/lambda combinations."""
@@ -698,7 +686,11 @@ def run_evaluation(
                             pooling=pooling,
                             batch_size=batch_size,
                             device="cuda",
-                            verbose=1
+                            verbose=1,
+                            use_cache=use_quality_cache, 
+                            cache_dir=quality_cache_dir,
+                            use_emb_cache=use_embedding_cache, 
+                            emb_cache_dir=embedding_cache_dir  
                         )
                         print(layer_quality)
                         encoder = create_aggregated_encoder(
@@ -710,7 +702,9 @@ def run_evaluation(
                             batch_size=batch_size,
                             pca_cache_dir=pca_cache_dir,
                             pooling=pooling,
-                            num_clusters=num_clusters
+                            num_clusters=num_clusters,
+                            use_cache=use_embedding_cache, 
+                            cache_dir=embedding_cache_dir 
                         )
 
                         task_result = mteb.evaluate(
@@ -782,6 +776,12 @@ def main():
                        help="MTEB task name to compute layer quality on (e.g., 'Banking77Classification'). "
                             "If specified, evaluates each layer on this task's validation set (notebook approach). "
                             "If not specified, evaluates on each task.")
+    parser.add_argument("--use-embedding-cache", action="store_true", 
+                   help="Cache layer embeddings")
+    parser.add_argument("--use-quality-cache", action="store_true", 
+                       help="Cache layer quality scores")
+    parser.add_argument("--embedding-cache-dir", type=str, default="./embedding_cache")
+    parser.add_argument("--quality-cache-dir", type=str, default="./quality_cache")
 
     args = parser.parse_args()
 
@@ -799,7 +799,11 @@ def main():
         num_clusters=args.num_clusters,
         overwrite_results=args.overwrite_results,
         max_samples=args.max_samples,
-        dataset_specific_task=args.dataset_specific_task
+        dataset_specific_task=args.dataset_specific_task,
+        use_embedding_cache=args.use_embedding_cache,
+        use_quality_cache=args.use_quality_cache,
+        embedding_cache_dir=args.embedding_cache_dir,
+        quality_cache_dir=args.quality_cache_dir
     )
 
 

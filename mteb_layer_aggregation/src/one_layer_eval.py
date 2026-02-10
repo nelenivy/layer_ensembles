@@ -11,6 +11,7 @@ from datasets import Dataset, DatasetDict
 from datasets import disable_caching
 import random
 from collections import defaultdict
+from src.cache_manager import QualityCache, EmbeddingCache
 
 def split_retrieval_data(queries, corpus, qrels, val_size=0.2, seed=42):
     """
@@ -60,9 +61,10 @@ def split_retrieval_data(queries, corpus, qrels, val_size=0.2, seed=42):
     }
 
 class SingleLayerEncoder(EncoderProtocol):
-    """Single layer encoder compatible with MTEB 2.0"""
+    """Encoder with sentence-level caching"""
     
-    def __init__(self, model, tokenizer, layer_idx, pooling, device, batch_size, model_name):
+    def __init__(self, model, tokenizer, layer_idx, pooling, device, 
+                 batch_size, model_name, use_cache=True, cache_dir="./embedding_cache"):
         self.model = model
         self.tokenizer = tokenizer
         self.layer_idx = layer_idx
@@ -70,7 +72,83 @@ class SingleLayerEncoder(EncoderProtocol):
         self.device = device
         self.batch_size = batch_size
         self.hidden_size = model.config.hidden_size
-        self.model_name = f"{model_name}_layer{layer_idx}"
+        self.model_name = model_name
+        
+        if use_cache:
+            self.embedding_cache = EmbeddingCache(cache_dir)
+        else:
+            self.embedding_cache = None
+    
+    def _encode_batch(self, sentences: List[str]) -> Optional[np.ndarray]:
+        """Encode batch with sentence-level caching"""
+        if not sentences:
+            return None
+        
+        # Normalize sentences
+        sentences = [str(s).strip() for s in sentences if s is not None]
+        sentences = [s for s in sentences if s]
+        
+        if not sentences:
+            return None
+        
+        # Check cache for each sentence
+        results = [None] * len(sentences)
+        uncached_indices = []
+        uncached_sentences = []
+        
+        if self.embedding_cache:
+            for i, sentence in enumerate(sentences):
+                cached = self.embedding_cache.get_sentence(
+                    self.model_name, self.layer_idx, self.pooling, sentence
+                )
+                if cached is not None:
+                    results[i] = cached
+                else:
+                    uncached_indices.append(i)
+                    uncached_sentences.append(sentence)
+        else:
+            uncached_indices = list(range(len(sentences)))
+            uncached_sentences = sentences
+        
+        # Compute uncached embeddings
+        if uncached_sentences:
+            try:
+                inputs = self.tokenizer(
+                    uncached_sentences,
+                    padding=True,
+                    truncation=True,
+                    max_length=512,
+                    return_tensors="pt"
+                ).to(self.device)
+                
+                with torch.no_grad():
+                    outputs = self.model(**inputs)
+                    hidden_states = outputs.hidden_states[self.layer_idx]
+                    
+                    if self.pooling == "cls":
+                        pooled = hidden_states[:, 0, :]
+                    else:  # mean
+                        mask = inputs['attention_mask'].unsqueeze(-1).float()
+                        pooled = (hidden_states * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
+                    
+                    new_embeddings = pooled.cpu().numpy()
+                
+                # Cache and store results
+                for i, emb in enumerate(new_embeddings):
+                    original_idx = uncached_indices[i]
+                    results[original_idx] = emb
+                    
+                    if self.embedding_cache:
+                        self.embedding_cache.set_sentence(
+                            self.model_name, self.layer_idx, self.pooling,
+                            sentences[original_idx], emb
+                        )
+            
+            except Exception as e:
+                print(f"Error encoding batch: {e}")
+                return None
+        
+        return np.vstack(results)
     
     def _extract_sentences_from_batch(self, batch):
         """Extract sentences from DataLoader batch."""
@@ -86,42 +164,6 @@ class SingleLayerEncoder(EncoderProtocol):
         else:
             return [str(batch)]
         return []
-    
-    def _encode_batch(self, sentences: List[str]) -> Optional[np.ndarray]:
-        """Encode a single batch of sentences."""
-        if not sentences:
-            return None
-        
-        # Filter empty strings
-        sentences = [str(s).strip() for s in sentences if s is not None]
-        sentences = [s for s in sentences if s]
-        if not sentences:
-            return None
-        
-        try:
-            inputs = self.tokenizer(
-                sentences,
-                padding=True,
-                truncation=True,
-                max_length=512,
-                return_tensors="pt"
-            ).to(self.device)
-            
-            with torch.no_grad():
-                outputs = self.model(**inputs)
-                hidden_states = outputs.hidden_states[self.layer_idx]
-                
-                # Apply pooling
-                if self.pooling == "cls":
-                    pooled = hidden_states[:, 0, :]
-                else:  # mean
-                    mask = inputs['attention_mask'].unsqueeze(-1).float()
-                    pooled = (hidden_states * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
-                
-                return pooled.cpu().numpy()
-        except Exception as e:
-            print(f"Error encoding batch: {e}")
-            return None
     
     def encode(
         self,
@@ -218,10 +260,14 @@ def compute_dataset_specific_layer_quality(
     pooling: str = "mean",
     batch_size: int = 32,
     device: str = "cuda",
-    verbose: int = 1
+    verbose: int = 1,
+    use_cache: bool = True, 
+    cache_dir: str = "./quality_cache",
+    use_emb_cache=True, 
+    emb_cache_dir="./embs_cache"  
 ) -> np.ndarray:
     """
-    Compute layer quality by evaluating each layer on a specific MTEB task.
+    Compute layer quality by evaluating each layer on a specific MTEB task with caching support.
     This implements the notebook approach where validation quality is computed
     for each dataset individually.
     
@@ -236,7 +282,13 @@ def compute_dataset_specific_layer_quality(
     Returns:
         layer_qualities: Array of shape (n_layers,) with quality scores
     """
-    
+
+    # Check cache first
+    if use_cache:
+        quality_cache = QualityCache(cache_dir)
+        cached_quality = quality_cache.get(model_name, pooling, task_name)
+        if cached_quality is not None:
+            return cached_quality
     if verbose >= 1:
         print(f"\n{'='*70}")
         print(f"Computing layer quality on: {task_name}")
@@ -347,7 +399,9 @@ def compute_dataset_specific_layer_quality(
                 pooling=pooling,
                 device=device,
                 batch_size=batch_size,
-                model_name=model_name
+                model_name=model_name,
+                use_cache=use_emb_cache, 
+                cache_dir=emb_cache_dir
             )
 
             # Evaluate on MTEB task
@@ -388,5 +442,9 @@ def compute_dataset_specific_layer_quality(
         print(f"\nLayer qualities computed!")
         print(f"Best layer: {np.argmax(layer_qualities)} (score: {np.max(layer_qualities):.4f})")
         print(f"Mean quality: {np.mean(layer_qualities):.4f}")
-    
+
+    # Cache the result
+    if use_cache:
+        quality_cache.set(model_name, pooling, task_name, layer_qualities)
+        
     return layer_qualities

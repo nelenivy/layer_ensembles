@@ -9,8 +9,9 @@ import pickle
 import numpy as np
 from typing import Any, Optional, Dict, Union, List
 from torch.utils.data import DataLoader
-
-from mteb.models import EncoderProtocol  # ✅ CORRECT IMPORT FROM ORIGINAL
+from mteb.models import EncoderProtocol  
+from transformers import AutoTokenizer, AutoModel
+from src.cache_manager import EmbeddingCache
 
 
 class SimpleWeightedAggregation:
@@ -43,38 +44,46 @@ class SimpleWeightedAggregation:
         self.weights = weights / weights.sum()
         self.weights_tensor = torch.from_numpy(self.weights).float()
 
-
 class LayerEncoder:
     """
-    Layer encoder that extracts all layers.
-    Includes pooler_output support for SimCSE models.
+    Layer encoder that extracts all layers with LMDB caching support.
     """
-
+    
     def __init__(
         self,
         model_name: str,
         pooling: str = "mean",
         batch_size: int = 32,
         device: str = "cuda",
-        use_pooler_output: bool = False
+        use_pooler_output: bool = False,
+        use_cache: bool = False,  # NEW
+        cache_dir: str = "./embedding_cache"  # NEW
     ):
-        from transformers import AutoTokenizer, AutoModel
-
         self.model_name = model_name
         self.pooling = pooling
         self.batch_size = batch_size
         self.device = device
         self.use_pooler_output = use_pooler_output
-
+        self.use_cache = use_cache
+        
         # Load model
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
         self.model = AutoModel.from_pretrained(
             model_name,
             output_hidden_states=True
         ).to(self.device).eval()
-
+        
         self.max_length = 512
-
+        self.num_layers = self.model.config.num_hidden_layers + 1
+        
+        # Initialize cache
+        if use_cache:
+            
+            self.cache = EmbeddingCache(cache_dir)
+            print(f"✓ LMDB cache enabled for LayerEncoder")
+        else:
+            self.cache = None
+    
     def pool(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         """Pool hidden states."""
         if self.pooling == "cls":
@@ -84,66 +93,217 @@ class LayerEncoder:
             return (hidden_states * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
         else:
             raise ValueError(f"Unknown pooling: {self.pooling}")
+    
+    def encode_batch(
+        self,
+        sentences: List[str],
+        return_all_layers: bool = True
+    ) -> Union[np.ndarray, List[np.ndarray]]:
+        """
+        Encode a batch of sentences.
+        
+        Args:
+            sentences: List of sentences to encode
+            return_all_layers: If True, return list of arrays (one per layer)
+                             If False, return single array (last layer only)
+        
+        Returns:
+            If return_all_layers: List[np.ndarray] of shape [(B, H)] * num_layers
+            Otherwise: np.ndarray of shape (B, H)
+        """
+        if not sentences:
+            return [] if return_all_layers else np.zeros((0, self.model.config.hidden_size))
+        
+        # Normalize sentences
+        sentences = [str(s).strip() for s in sentences if s]
+        if not sentences:
+            return [] if return_all_layers else np.zeros((0, self.model.config.hidden_size))
+        
+        # Check cache for each layer
+        if self.use_cache and self.cache:
+            cached_layers = self._get_cached_batch(sentences)
+            if cached_layers is not None:
+                # All layers cached
+                if return_all_layers:
+                    return cached_layers
+                else:
+                    return cached_layers[-1]  # Return last layer
+            
+            # Partial cache hit - for now, recompute all
+            # (You could optimize this to only compute missing layers)
+        
+        # Compute embeddings
+        try:
+            inputs = self.tokenizer(
+                sentences,
+                padding=True,
+                truncation=True,
+                max_length=self.max_length,
+                return_tensors="pt"
+            ).to(self.device)
+            
+            with torch.no_grad():
+                outputs = self.model(**inputs)
+                hidden_states = outputs.hidden_states
+                
+                # Extract all layers
+                all_layer_embeddings = []
+                for layer_idx in range(self.num_layers):
+                    layer_hidden = hidden_states[layer_idx]
+                    pooled = self.pool(layer_hidden, inputs['attention_mask'])
+                    all_layer_embeddings.append(pooled.cpu().numpy())
+                
+                # Add pooler_output if requested
+                if self.use_pooler_output and outputs.pooler_output is not None:
+                    all_layer_embeddings.append(outputs.pooler_output.cpu().numpy())
+            
+            # Cache all layers
+            if self.use_cache and self.cache:
+                self._cache_batch(sentences, all_layer_embeddings)
+            
+            if return_all_layers:
+                return all_layer_embeddings
+            else:
+                return all_layer_embeddings[-1]
+        
+        except Exception as e:
+            print(f"Error in encode_batch: {e}")
+            if return_all_layers:
+                return [np.zeros((len(sentences), self.model.config.hidden_size)) 
+                       for _ in range(self.num_layers)]
+            else:
+                return np.zeros((len(sentences), self.model.config.hidden_size))
+    
+    def _get_cached_batch(self, sentences: List[str]) -> Optional[List[np.ndarray]]:
+        """
+        Try to get all layers for all sentences from cache.
+        Returns None if any sentence/layer is missing.
+        """
+        # Check if all sentences have all layers cached
+        all_cached = []
+        
+        for layer_idx in range(self.num_layers):
+            layer_embeddings = []
+            for sentence in sentences:
+                emb = self.cache.get_sentence(
+                    self.model_name, layer_idx, self.pooling, sentence
+                )
+                if emb is None:
+                    return None  # Cache miss
+                layer_embeddings.append(emb)
+            
+            all_cached.append(np.vstack(layer_embeddings))
+        
+        return all_cached
+    
+    def _cache_batch(self, sentences: List[str], all_layer_embeddings: List[np.ndarray]):
+        """Cache all layers for all sentences"""
+        for layer_idx, layer_embs in enumerate(all_layer_embeddings):
+            for sentence, emb in zip(sentences, layer_embs):
+                self.cache.set_sentence(
+                    self.model_name, layer_idx, self.pooling, sentence, emb
+                )
+    
+    def __del__(self):
+        """Close cache on cleanup"""
+        if hasattr(self, 'cache') and self.cache:
+            self.cache.close()
 
 
-class AggregatedEncoder(EncoderProtocol):  # ✅ CORRECT INHERITANCE
+class AggregatedEncoder(EncoderProtocol):
     """
-    Aggregated encoder that USES the weights you set!
-    Inherits from MTEB's EncoderProtocol for full compatibility.
+    Aggregated encoder with caching support.
     """
-
+    
     def __init__(
         self,
         model_name: str,
-        similarity_matrix_path: Optional[str] = None,
-        similarity_matrix: Optional[np.ndarray] = None,
         pooling: str = "mean",
         batch_size: int = 32,
         device: Optional[str] = None,
         aggregation_weights: Optional[np.ndarray] = None,
-        normalize_weights: bool = False,  # Ignored, kept for compatibility
-        use_pooler_output: bool = False
+        normalize_weights: bool = False,
+        use_pooler_output: bool = False,
+        use_cache: bool = False,
+        cache_dir: str = "./embedding_cache"
     ):
-        """Initialize encoder."""
+        """Initialize encoder with caching support."""
         if not model_name:
             raise ValueError("model_name is required!")
-
+        
         self.model_name = model_name
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-
-        # Load similarity matrix (for reference, not used if weights provided)
-        if similarity_matrix is not None:
-            sim_matrix = similarity_matrix
-        elif similarity_matrix_path is not None:
-            with open(similarity_matrix_path, 'rb') as f:
-                sim_matrix = pickle.load(f)
-            sim_matrix = np.asarray(sim_matrix, dtype=np.float32)
-        else:
-            raise ValueError("Must provide similarity_matrix or similarity_matrix_path")
-
+        
         self.pooling = pooling
         self.batch_size = batch_size
-        self.num_layers = sim_matrix.shape[0]
+        self.num_layers = aggregation_weights.shape[0]
         self.use_pooler_output = use_pooler_output
-
-        # Create layer encoder
+        
+        # Create layer encoder WITH CACHING
         self.encoder = LayerEncoder(
             model_name=self.model_name,
             pooling=pooling,
             batch_size=batch_size,
             device=self.device,
-            use_pooler_output=use_pooler_output
+            use_pooler_output=use_pooler_output,
+            use_cache=use_cache,  # Pass through
+            cache_dir=cache_dir   # Pass through
         )
+        
         self.hidden_size = self.encoder.model.config.hidden_size
-
-        # CRITICAL: Use simple aggregation with weights
+        
+        # Setup aggregation weights
         if aggregation_weights is not None:
             initial_weights = aggregation_weights
         else:
-            # Uniform weights by default
             initial_weights = np.ones(self.num_layers) / self.num_layers
 
         self.aggregator = SimpleWeightedAggregation(initial_weights)
+    
+    def _encode_batch(self, sentences: List[str]) -> np.ndarray:
+        """Encode a single batch using cached layer encoder."""
+        if not sentences or len(sentences) == 0:
+            return None
+        
+        sentences = [str(s).strip() for s in sentences if s is not None]
+        sentences = [s for s in sentences if s]
+        
+        if not sentences:
+            return None
+        
+        try:
+            # Get all layer embeddings (uses cache internally)
+            all_layer_embs = self.encoder.encode_batch(
+                sentences, return_all_layers=True
+            )
+            
+            if not all_layer_embs:
+                return np.zeros((len(sentences), self.hidden_size), dtype=np.float32)
+            
+            # Stack: (num_layers, B, H)
+            all_layer_embs = [
+                torch.from_numpy(emb) if isinstance(emb, np.ndarray) else emb
+                for emb in all_layer_embs
+            ]
+            all_layer_embs = torch.stack(all_layer_embs, dim=0)
+            
+            # Aggregate using weights
+            result = self.aggregator.aggregate(all_layer_embs)
+            
+            if result is None:
+                return np.zeros((len(sentences), self.hidden_size), dtype=np.float32)
+            
+            if isinstance(result, torch.Tensor):
+                result = result.cpu().numpy()
+            
+            return result
+        
+        except Exception as e:
+            print(f"ERROR in _encode_batch: {e}")
+            import traceback
+            traceback.print_exc()
+            return np.zeros((len(sentences), self.hidden_size), dtype=np.float32)
+
 
     # ========== MTEB Interface Methods ==========
 
@@ -259,67 +419,6 @@ class AggregatedEncoder(EncoderProtocol):  # ✅ CORRECT INHERITANCE
         else:
             return [str(batch)]
         return []
-
-    def _encode_batch(self, sentences: List[str]) -> np.ndarray:
-        """Encode a single batch."""
-        if not sentences or len(sentences) == 0:
-            return None
-
-        # Filter empty sentences
-        sentences = [str(s).strip() for s in sentences if s is not None]
-        sentences = [s for s in sentences if s]
-        if not sentences:
-            return None
-
-        try:
-            # Tokenize
-            encoded = self.encoder.tokenizer(
-                sentences,
-                padding=True,
-                truncation=True,
-                max_length=self.encoder.max_length,
-                return_tensors="pt"
-            )
-            encoded = {k: v.to(self.device) for k, v in encoded.items()}
-
-            # Forward pass
-            with torch.no_grad():
-                outputs = self.encoder.model(**encoded)
-
-                # Extract all layers
-                all_layer_embs = []
-                for layer_idx in range(self.num_layers):
-                    hidden_states = outputs.hidden_states[layer_idx]
-                    pooled = self.encoder.pool(hidden_states, encoded['attention_mask'])
-
-                    if pooled is None:
-                        pooled = torch.zeros(len(sentences), self.hidden_size, device=self.device)
-
-                    all_layer_embs.append(pooled)
-
-                # Add pooler_output if requested
-                if self.use_pooler_output and outputs.pooler_output is not None:
-                    all_layer_embs.append(outputs.pooler_output)
-
-                # Stack: (num_layers, B, H)
-                all_layer_embs = torch.stack(all_layer_embs, dim=0)
-
-                # Aggregate using weights
-                result = self.aggregator.aggregate(all_layer_embs)
-
-                if result is None:
-                    return np.zeros((len(sentences), self.hidden_size), dtype=np.float32)
-
-                if isinstance(result, torch.Tensor):
-                    result = result.cpu().numpy()
-
-                return result
-
-        except Exception as e:
-            print(f"ERROR in _encode_batch: {e}")
-            import traceback
-            traceback.print_exc()
-            return np.zeros((len(sentences), self.hidden_size), dtype=np.float32)
 
     # ========== Weight Management ==========
 
