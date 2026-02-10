@@ -265,6 +265,8 @@ def compute_dataset_specific_layer_quality(
 
     # Loads the dataset from HuggingFace
     dataset_to_use = task.dataset['default'] if 'default' in task.dataset else task.dataset
+    dataset_to_use = dataset_to_use['en'] if 'en' in dataset_to_use else dataset_to_use
+    dataset_to_use = dataset_to_use['default'] if 'default' in dataset_to_use else dataset_to_use
     val_name = None
     
     for split_name in val_splits:
@@ -292,8 +294,6 @@ def compute_dataset_specific_layer_quality(
         dataset_to_use['validation'] = trainval['test']
         val_name = 'validation'
           
-    dataset_to_use = task.dataset['default'] if 'default' in task.dataset else task.dataset
-    print(list(dataset_to_use.keys()))
     task.__dict__['_eval_splits'] = [val_name]
     # SIMPLE FIX: Set n_experiments directly if it's a classification task
     if hasattr(task, 'n_experiments'):
