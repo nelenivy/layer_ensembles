@@ -7,6 +7,57 @@ import mteb
 import logging  
 import warnings
 from torch.utils.data import DataLoader
+from datasets import Dataset, DatasetDict
+from datasets import disable_caching
+import random
+from collections import defaultdict
+
+def split_retrieval_data(queries, corpus, qrels, val_size=0.2, seed=42):
+    """
+    Split retrieval data into train/test sets.
+    
+    Parameters:
+    - queries: dict {query_id: query_text}
+    - corpus: dict {doc_id: doc_text}
+    - qrels: dict {query_id: {doc_id: relevance_score}}
+    - val_size: fraction for validation (0.0 to 1.0)
+    - seed: random seed
+    
+    Returns:
+    - dict with 'train' and 'test' splits
+    """
+    random.seed(seed)
+    
+    # Get all query IDs and shuffle
+    all_query_ids = list(qrels.keys())
+    random.shuffle(all_query_ids)
+    
+    # Split query IDs
+    split_point = int(len(all_query_ids) * (1 - val_size))
+    train_qids = set(all_query_ids[:split_point])
+    val_qids = set(all_query_ids[split_point:])
+    
+    # Split queries
+    train_queries = {qid: queries[qid] for qid in train_qids if qid in queries}
+    val_queries = {qid: queries[qid] for qid in val_qids if qid in queries}
+    
+    # Split qrels
+    train_qrels = {qid: qrels[qid] for qid in train_qids if qid in qrels}
+    val_qrels = {qid: qrels[qid] for qid in val_qids if qid in qrels}
+    
+    # Corpus is shared (no split needed)
+    return {
+        'train': {
+            'queries': train_queries,
+            'corpus': corpus,
+            'qrels': train_qrels
+        },
+        'test': {
+            'queries': val_queries,
+            'corpus': corpus,
+            'qrels': val_qrels
+        }
+    }
 
 class SingleLayerEncoder(EncoderProtocol):
     """Single layer encoder compatible with MTEB 2.0"""
@@ -164,7 +215,6 @@ class SingleLayerEncoder(EncoderProtocol):
 def compute_dataset_specific_layer_quality(
     model_name: str,
     task_name: str,
-    split: str = "validation",
     pooling: str = "mean",
     batch_size: int = 32,
     device: str = "cuda",
@@ -178,7 +228,6 @@ def compute_dataset_specific_layer_quality(
     Args:
         model_name: HuggingFace model name
         task_name: MTEB task name (e.g., "Banking77Classification")
-        split: Split to evaluate on ("validation", "dev", "test")
         pooling: Pooling strategy ('mean' or 'cls')
         batch_size: Batch size for encoding
         device: Device for computation
@@ -190,12 +239,67 @@ def compute_dataset_specific_layer_quality(
     
     if verbose >= 1:
         print(f"\n{'='*70}")
-        print(f"Computing layer quality on: {task_name} ({split} split)")
+        print(f"Computing layer quality on: {task_name}")
         print(f"{'='*70}\n")
     
     # Load task
-    task = mteb.get_task(task_name)
+    val_splits = ['dev', 'validation', 'val']
+    # Disable caching globally
+    disable_caching()
+    task = None
+    for split_name in val_splits:
+        try:
+            print(split_name)
+            print(1)
+            task = mteb.get_task(task_name, languages=['eng'], eval_splits=[split_name], exclusive_language_filter=True)
+            print(2)
+            task.load_data()
+            print(3)
+            break
+        except:
+            task = None
+            
+    if task is None:
+        task = mteb.get_task(task_name, languages=['eng'], eval_splits=['train'])
+        task.load_data()
+
+    # Loads the dataset from HuggingFace
+    dataset_to_use = task.dataset['default'] if 'default' in task.dataset else task.dataset
+    val_name = None
     
+    for split_name in val_splits:
+        if split_name in dataset_to_use:
+            val_name = split_name
+            print("!!!!!!!!!!!!!!!!!! found!!!!!!!!!!!!!!!!!")
+
+    if val_name is None:
+        print("!!!!!!!!!!!!!!!!!!NOT found!!!!!!!!!!!!!!!!!")
+        print(list(dataset_to_use.keys()))
+        # Monkey-patch the task's dataset
+
+        if type(dataset_to_use['train']) is dict:
+            #retrieval tasks
+            # Then use the split function above
+            trainval = split_retrieval_data(
+                dataset_to_use['train']['queries'],
+                dataset_to_use['train']['corpus'],
+                dataset_to_use['train']['qrels']
+            )
+        else:
+            trainval = dataset_to_use['train'].train_test_split(test_size=0.2, seed=42)
+            
+        dataset_to_use['train'] = trainval['train']
+        dataset_to_use['validation'] = trainval['test']
+        val_name = 'validation'
+          
+    dataset_to_use = task.dataset['default'] if 'default' in task.dataset else task.dataset
+    print(list(dataset_to_use.keys()))
+    task.__dict__['_eval_splits'] = [val_name]
+    # SIMPLE FIX: Set n_experiments directly if it's a classification task
+    if hasattr(task, 'n_experiments'):
+        if verbose >= 2:
+            print(f"  Setting n_experiments={1} (was {task.n_experiments})")
+        task.n_experiments = 1
     # Load model once for all layers
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
     model = AutoModel.from_pretrained(
@@ -211,8 +315,8 @@ def compute_dataset_specific_layer_quality(
     # Temporarily suppress MTEB logging
     # Suppress warnings
     with warnings.catch_warnings():
-        warnings.filterwarnings('ignore', category=FutureWarning)
-        warnings.filterwarnings('ignore', category=UserWarning)
+        #warnings.filterwarnings('ignore', category=FutureWarning)
+        #warnings.filterwarnings('ignore', category=UserWarning)
         # Suppress all MTEB-related and HTTP logging
         loggers_to_suppress = [
             'mteb', 
@@ -228,13 +332,13 @@ def compute_dataset_specific_layer_quality(
         for logger_name in loggers_to_suppress:
             logger = logging.getLogger(logger_name)
             original_levels[logger_name] = logger.level
-            logger.setLevel(logging.ERROR)  # Only critical errors
+            logger.setLevel(logging.INFO)  # Only critical errors
             
         # Evaluate each layer
         for layer_idx in range(n_layers):
             if verbose >= 1:
                 print(f"  Layer {layer_idx}/{n_layers-1}...", end=" ", flush=True)
-            
+
             # Create encoder for this layer
             encoder = SingleLayerEncoder(
                 model=model,
@@ -245,45 +349,35 @@ def compute_dataset_specific_layer_quality(
                 batch_size=batch_size,
                 model_name=model_name
             )
-            
+
             # Evaluate on MTEB task
-    
-            try:
-                results = mteb.evaluate(
-                    model=encoder,
-                    tasks=[task],
-                    # Remove eval_splits - it's passed via task or results extraction
-                    encode_kwargs={"batch_size": batch_size},
-                    show_progress_bar=False,
-                    overwrite_strategy="always"  #'only-missing'
-                )
-                # Extract main score for the requested split
-                # results is a list of TaskResult objects
-                task_result = results[0]
-                
-                # Try to get the requested split, fallback to available splits
-                if split in task_result.scores:
-                    scores = task_result.scores[split][0]
-                else:
-                    # Fallback to first available split
-                    available_splits = list(task_result.scores.keys())
-                    if available_splits:
-                        scores = task_result.scores[available_splits[0]][0]
-                        if verbose >= 2 and layer_idx == 0:
-                            print(f"\n  Note: '{split}' not available, using '{available_splits[0]}'")
-                    else:
-                        raise ValueError("No evaluation splits available")
-                
-                quality = scores.get('main_score', 0.0)
-                layer_qualities.append(quality)
-                
-                if verbose >= 1:
-                    print(f"{quality:.4f}")
+            #try:
+            results = mteb.evaluate(
+                model=encoder,
+                #eval_splits=[val_name],
+                tasks=[task],
+                # Remove eval_splits - it's passed via task or results extraction
+                encode_kwargs={"batch_size": batch_size},
+                show_progress_bar=False,
+                overwrite_strategy="always"  #'only-missing'
+            )
+
+            # Extract main score for the requested split
+            # results is a list of TaskResult objects
+            task_result = results[0]
+
+            # Try to get the requested split, fallback to available splits
+            scores = task_result.scores[val_name][0]
+            quality = scores.get('main_score', 0.0)
+            layer_qualities.append(quality)
+            
+            if verbose >= 1:
+                print(f"{quality:.4f}")
                     
-            except Exception as e:
-                if verbose >= 1:
-                    print(f"ERROR: {e}")
-                layer_qualities.append(0.0)
+            # except Exception as e:
+            #     if verbose >= 1:
+            #         print(f"ERROR: {e}")
+            #     layer_qualities.append(0.0)
             
     # Restore original logging levels
     for logger_name, level in original_levels.items():

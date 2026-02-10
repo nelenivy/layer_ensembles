@@ -74,6 +74,55 @@ IMAGE_TASK_NAMES = [
     "VOC2007Classification", "ImageNet", "Places365",
 ]
 
+# After IMAGE_TASK_NAMES definition, add:
+
+# Core representative MTEB tasks for fast evaluation
+# Optimized for Information Retrieval research (SIGIR focus)
+# CORE_MTEB_TASKS = [
+#     # Classification (3)
+#     "Banking77Classification",
+#     "AmazonCounterfactualClassification", 
+#     "ToxicConversationsClassification",
+    
+#     # STS - Semantic Textual Similarity (2)
+#     "STSBenchmark",
+#     "SICK-R",             # Correct: has hyphen
+    
+#     # Retrieval (7) - SIGIR focus: diverse domains and difficulty levels
+#     "NFCorpus",           # Medical/biomedical - small corpus
+#     "SciFact",            # Scientific fact verification - expert claims
+#     "TRECCOVID",          # Correct: no hyphen
+#     "FiQA2018",           # Financial QA - technical domain
+#     "ArguAna",            # Argument retrieval - complex reasoning
+#     "HotpotQA",           # Multi-hop QA - requires reasoning chains
+#     "NQ",                 # Natural Questions - Google search queries
+    
+#     # Clustering (2)
+#     "TwentyNewsgroupsClustering",
+#     "ArxivClusteringP2P",
+    
+#     # Reranking (1)
+#     "AskUbuntuDupQuestions"
+# ]
+
+CORE_MTEB_TASKS = {
+# Retrieval (8)
+    "NFCorpus", "SciFact", "FiQA2018", "QuoraRetrieval",
+    # Classification (4)
+    "Banking77Classification", "AmazonCounterfactualClassification","EmotionClassification",
+    # STS (2)
+    "STSBenchmark", "SICK-R",
+    # Pair Classification (1)
+    "SprintDuplicateQuestions",
+    # Reranking (1)
+    "MindSmallReranking",
+    # # Clustering (1)
+    # "TwentyNewsgroupsClustering",
+    # # Summarization (1)
+    # "SummEval",
+}
+
+
 
 def filter_text_only_tasks(tasks: List[Any]) -> List[Any]:
     """Filter to keep ONLY text-only tasks."""
@@ -577,12 +626,33 @@ def run_evaluation(
     os.makedirs(output_dir, exist_ok=True)
 
     logger.info("Loading MTEB tasks...")
-
-    if tasks and "all" in [t.lower() for t in tasks]:
-        logger.info("Loading ALL available MTEB tasks")
-        all_tasks = mteb.get_tasks(languages=["eng"])
+    # Handle special task keywords
+    if tasks and len(tasks) == 1:
+        task_keyword = tasks[0].lower()
+        
+        if task_keyword == "all":
+            # Load ALL available MTEB tasks
+            logger.info("Loading ALL available MTEB tasks (~700+ tasks)")
+            all_tasks = mteb.get_tasks(languages=["eng"])
+            
+        elif task_keyword == "mteb-v2" or tasks[0] == "MTEB(eng, v2)":
+            # Load official MTEB v2 benchmark (41 tasks)
+            logger.info("Loading MTEB(eng, v2) benchmark (41 curated tasks)")
+            all_tasks = mteb.get_tasks(benchmark="MTEB(eng, v2)")
+            
+        elif task_keyword == "core":
+            # Load core representative tasks (12-15 tasks)
+            logger.info(f"Loading Core MTEB tasks ({len(CORE_MTEB_TASKS)} representative tasks)")
+            logger.info(f"Tasks: {', '.join(CORE_MTEB_TASKS)}")
+            all_tasks = mteb.get_tasks(tasks=CORE_MTEB_TASKS, languages=["eng"])
+            
+        else:
+            # Single specific task
+            all_tasks = mteb.get_tasks(tasks=tasks, languages=["eng"])
     else:
+        # Multiple specific tasks listed
         all_tasks = mteb.get_tasks(tasks=tasks, languages=["eng"])
+
 
     all_tasks = filter_text_only_tasks(all_tasks)
 
@@ -625,7 +695,6 @@ def run_evaluation(
                         layer_quality = compute_dataset_specific_layer_quality(
                             model_name=model_name,
                             task_name=task_to_use,
-                            split="validation",
                             pooling=pooling,
                             batch_size=batch_size,
                             device="cuda",
@@ -692,7 +761,8 @@ def main():
 
     parser.add_argument("--model-name", type=str, required=True, help="HuggingFace model name")
     parser.add_argument("--similarity-matrix", type=str, required=True, help="Path to similarity matrix pickle")
-    parser.add_argument("--tasks", type=str, nargs="+", required=True, help='MTEB task names or "all"')
+    parser.add_argument("--tasks", type=str, nargs="+", required=True, 
+                       help='Task selection: "all" (~700 tasks), "mteb-v2" (41 tasks), "core" (15 tasks), or specific task names')
     parser.add_argument("--task-types", type=str, nargs="+", default=None,
                        choices=["Classification", "Clustering", "PairClassification", "Reranking", "Retrieval", "STS", "Summarization"],
                        help="Filter by task type")
