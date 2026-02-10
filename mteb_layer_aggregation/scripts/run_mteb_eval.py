@@ -106,16 +106,16 @@ IMAGE_TASK_NAMES = [
 # ]
 
 CORE_MTEB_TASKS = {
-# Retrieval (8)
-    #"NFCorpus", "SciFact", "FiQA2018", "QuoraRetrieval",
+# Retrieval (4)
+    "NFCorpus", "SciFact", "FiQA2018", "QuoraRetrieval",
     # Classification (4)
     "Banking77Classification", "AmazonCounterfactualClassification","EmotionClassification",
-    # STS (2)
-    #"STSBenchmark", #"SICK-R",
+    # STS (1)
+    "STSBenchmark", #"SICK-R",
     # Pair Classification (1)
-    #"SprintDuplicateQuestions",
+    "SprintDuplicateQuestions",
     # Reranking (1)
-    #"MindSmallReranking",
+    "MindSmallReranking",
     # # Clustering (1)
     # "TwentyNewsgroupsClustering",
     # # Summarization (1)
@@ -671,7 +671,7 @@ def run_evaluation(
                 for task in all_tasks:
                     task_name = task.metadata.name
                     logger.info(f"\n>>> Running task: {task_name}")
-                    # NEW: Filter by sample count
+                    
                     if max_samples is not None:
                         res = filter_by_sample_count([task], max_samples)
                         if not res:

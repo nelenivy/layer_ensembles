@@ -13,7 +13,7 @@ import random
 from collections import defaultdict
 from src.cache_manager import QualityCache, EmbeddingCache
 
-def split_retrieval_data(queries, corpus, qrels, val_size=0.2, seed=42):
+def split_retrieval_data(queries, corpus, qrels, val_size=0.2, seed=42, qrels_key='qrels'):
     """
     Split retrieval data into train/test sets.
     
@@ -51,12 +51,12 @@ def split_retrieval_data(queries, corpus, qrels, val_size=0.2, seed=42):
         'train': {
             'queries': train_queries,
             'corpus': corpus,
-            'qrels': train_qrels
+            qrels_key: train_qrels
         },
         'test': {
             'queries': val_queries,
             'corpus': corpus,
-            'qrels': val_qrels
+            qrels_key: val_qrels
         }
     }
 
@@ -314,7 +314,7 @@ def compute_dataset_specific_layer_quality(
     if task is None:
         task = mteb.get_task(task_name, languages=['eng'], eval_splits=['train'])
         task.load_data()
-
+    task_type = task.metadata.type
     # Loads the dataset from HuggingFace
     dataset_to_use = task.dataset['default'] if 'default' in task.dataset else task.dataset
     dataset_to_use = dataset_to_use['en'] if 'en' in dataset_to_use else dataset_to_use
@@ -330,22 +330,34 @@ def compute_dataset_specific_layer_quality(
         print("!!!!!!!!!!!!!!!!!!NOT found!!!!!!!!!!!!!!!!!")
         print(list(dataset_to_use.keys()))
         # Monkey-patch the task's dataset
-
-        if type(dataset_to_use['train']) is dict:
-            #retrieval tasks
-            # Then use the split function above
-            trainval = split_retrieval_data(
-                dataset_to_use['train']['queries'],
-                dataset_to_use['train']['corpus'],
-                dataset_to_use['train']['qrels']
-            )
-        else:
+        print(task_type)
+        if task_type == "Classification":
+            print('for classification')
             trainval = dataset_to_use['train'].train_test_split(test_size=0.2, seed=42)
-            
-        dataset_to_use['train'] = trainval['train']
-        dataset_to_use['validation'] = trainval['test']
-        val_name = 'validation'
-          
+            dataset_to_use['train'] = trainval['train']
+            dataset_to_use['validation'] = trainval['test']
+            val_name = 'validation'
+        else:
+            val_name = 'train'
+        # if type(dataset_to_use['train']) is dict:
+        #     print(list(dataset_to_use['train'].keys()))
+        #     #retrieval tasks
+        #     # Determine qrels key name
+        #     qrels_key = None
+        #     if 'qrels' in dataset_to_use['train']:
+        #         qrels_key = 'qrels'
+        #     elif 'relevant_docs' in dataset_to_use['train']:
+        #         qrels_key = 'relevant_docs'
+        #     else:
+        #         raise ValueError(f"Cannot find qrels/relevant_docs in {keys}")
+        #     # Then use the split function above
+        #     trainval = split_retrieval_data(
+        #         dataset_to_use['train']['queries'],
+        #         dataset_to_use['train']['corpus'],
+        #         dataset_to_use['train'][qrels_key],
+        #         qrels_key=qrels_key
+        #     )
+                
     task.__dict__['_eval_splits'] = [val_name]
     # SIMPLE FIX: Set n_experiments directly if it's a classification task
     if hasattr(task, 'n_experiments'):
