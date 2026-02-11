@@ -569,7 +569,7 @@ def update_results_tables(output_dir: str, config_name: str, task_name: str, mai
                     elif value == 'ERROR':
                         row.append('ERROR')
                     elif isinstance(value, (int, float)):
-                        row.append(f'{value:.4f}')
+                        row.append(f'{value:.6f}')
                     else:
                         row.append(str(value))
                 writer.writerow(row)
@@ -594,7 +594,7 @@ def update_results_tables(output_dir: str, config_name: str, task_name: str, mai
                     elif value == 'ERROR':
                         row.append('ERROR')
                     elif isinstance(value, (int, float)):
-                        row.append(f'{value:.4f}')
+                        row.append(f'{value:.6f}')
                     else:
                         row.append(str(value))
                 f.write('| ' + ' | '.join(row) + ' |\n')
