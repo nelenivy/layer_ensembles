@@ -231,13 +231,18 @@ class AggregatedEncoder(EncoderProtocol):
         """Initialize encoder with caching support."""
         if not model_name:
             raise ValueError("model_name is required!")
+
+        if aggregation_weights is not None:
+            initial_weights = aggregation_weights
+        else:
+            initial_weights = np.ones(self.num_layers)
         
         self.model_name = model_name
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         
         self.pooling = pooling
         self.batch_size = batch_size
-        self.num_layers = aggregation_weights.shape[0]
+        self.num_layers = initial_weights.shape[0]
         self.use_pooler_output = use_pooler_output
         
         # Create layer encoder WITH CACHING
@@ -254,10 +259,6 @@ class AggregatedEncoder(EncoderProtocol):
         self.hidden_size = self.encoder.model.config.hidden_size
         
         # Setup aggregation weights
-        if aggregation_weights is not None:
-            initial_weights = aggregation_weights
-        else:
-            initial_weights = np.ones(self.num_layers)
 
         self.aggregator = SimpleWeightedAggregation(initial_weights)
     
