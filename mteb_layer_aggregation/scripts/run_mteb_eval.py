@@ -357,7 +357,9 @@ def create_aggregated_encoder(
             pca_components=pca_result['components'],
             pca_mean=pca_result['mean'],
             batch_size=batch_size,
-            pooling=pooling
+            pooling=pooling,
+            use_cache=use_cache, 
+            cache_dir=cache_dir   
         )
 
     elif method == "concat+pca+cluster":
@@ -390,7 +392,9 @@ def create_aggregated_encoder(
             pca_components=pca_result['components'],
             pca_mean=pca_result['mean'],
             batch_size=batch_size,
-            pooling=pooling
+            pooling=pooling,
+            use_cache=use_cache, 
+            cache_dir=cache_dir   
         )
 
     elif method == "concat+pca+all":
@@ -415,7 +419,9 @@ def create_aggregated_encoder(
             pca_components=pca_result['components'],
             pca_mean=pca_result['mean'],
             batch_size=batch_size,
-            pooling=pooling
+            pooling=pooling,
+            use_cache=use_cache, 
+            cache_dir=cache_dir   
         )
 
     else:
