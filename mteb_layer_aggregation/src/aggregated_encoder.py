@@ -57,8 +57,8 @@ class LayerEncoder:
         batch_size: int = 32,
         device: str = "cuda",
         use_pooler_output: bool = False,
-        use_cache: bool = False,  # NEW
-        cache_dir: str = "./embedding_cache"  # NEW
+        use_cache: bool = False,  
+        cache_dir: str = "./embedding_cache"  
     ):
         self.model_name = model_name
         self.pooling = pooling
@@ -79,9 +79,8 @@ class LayerEncoder:
         
         # Initialize cache
         if use_cache:
-            
             self.cache = EmbeddingCache(cache_dir)
-            print(f"✓ LMDB cache enabled for LayerEncoder")
+            print(f"✓ cache enabled for LayerEncoder")
         else:
             self.cache = None
     

@@ -35,8 +35,10 @@ from src.pca_encoders import (
 )
 from src.strategies import (
     compute_similarity_weights,
-    compute_greedy_weights,
-    compute_greedy_weights_v2,
+    compute_greedy_weights_rank,
+    compute_greedy_weights_value,
+    compute_greedy_weights_delta,
+    compute_similarity_weights_greedy,
     compute_layer_clusters,
     compute_cluster_weights_for_pca,
     normalize_weights
@@ -271,25 +273,33 @@ def compute_method_weights(
     similarity_matrix: np.ndarray,
     layer_quality: np.ndarray,
     lmbd: float,
+    normalize_layer_quality=False,
     num_clusters: int = 4
 ) -> np.ndarray:
+    if normalize_layer_quality:
+        print('NORMALIZE LAYER QUALITIES')
+        layer_quality = layer_quality / layer_quality.sum()
     """Compute aggregation weights based on method."""
     if method == "weighted":
         weights = compute_similarity_weights(similarity_matrix, layer_quality, lmbd)
-    elif method == "greedy":
-        weights = compute_greedy_weights(similarity_matrix, layer_quality, lmbd)
-    elif method == "greedyv2":
-        weights = compute_greedy_weights_v2(similarity_matrix, layer_quality, lmbd)
+    elif method == 'weighted_greedy':
+        weights = compute_similarity_weights_greedy(similarity_matrix, layer_quality, lmbd)
+    elif method == "greedy_rank":
+        weights = compute_greedy_weights_rank(similarity_matrix, layer_quality, lmbd)
+    elif method == "greedy_val":
+        weights = compute_greedy_weights_value(similarity_matrix, layer_quality, lmbd)
+    elif method == "greedy_delta":
+        weights = compute_greedy_weights_delta(similarity_matrix, layer_quality, lmbd)
     elif method == "mean":
-        weight = np.ones(len(layer_quality))
+        weights = np.ones(len(layer_quality))
     elif method == "last":
-        weight = np.zeros(len(layer_quality))
-        weight[-1] = 1
+        weights = np.zeros(len(layer_quality))
+        weights[-1] = 1
     elif method == "best":
-        weight = np.zeros(len(layer_quality))
-        weight[np.argmax(layer_qualities)] = 1
+        weights = np.zeros(len(layer_quality))
+        weights[np.argmax(layer_qualities)] = 1
     elif method == "weighted_best":
-        weight = layer_qualities
+        weights = layer_qualities
     elif method == "cluster":
         clusters = compute_layer_clusters(similarity_matrix, num_clusters)
         num_layers = similarity_matrix.shape[0]
@@ -311,6 +321,7 @@ def create_aggregated_encoder(
     method: str,
     layer_quality: np.ndarray,
     lmbd: float,
+    normalize_layer_quality=False,
     batch_size: int = 32,
     pca_cache_dir: str = "./pca_cache",
     pooling: str = "mean",
@@ -320,8 +331,9 @@ def create_aggregated_encoder(
 ):
     """Create encoder with method-specific weights or PCA."""
 
-    if method in ["weighted", "greedy", "greedyv2", "cluster", "mean", "last", "best", "weighted_best"]:
-        weights = compute_method_weights(method, similarity_matrix, layer_quality, lmbd, num_clusters)
+    if method in ["weighted", 'weighted_greedy', "greedy_rank", "greedy_val",
+            "greedy_delta", "cluster", "mean", "last", "best", "weighted_best"]:
+        weights = compute_method_weights(method, similarity_matrix, layer_quality, lmbd, normalize_layer_quality, num_clusters)
 
         encoder = AggregatedEncoder(
             model_name=model_name,
@@ -611,6 +623,7 @@ def run_evaluation(
     methods: List[str],
     lambda_values: List[float],
     output_dir: str,
+    normalize_layer_quality=False,
     batch_size: int = 32,
     pca_cache_dir: str = "./pca_cache",
     pooling: str = "mean",
@@ -668,10 +681,13 @@ def run_evaluation(
         return
 
     results = {}
-
+    methods_with_lambda = ["weighted", 'weighted_greedy', "greedy_rank", "greedy_val", "greedy_delta"]
+    methods_with_normalize = ["weighted", 'weighted_greedy', "greedy_rank", "greedy_val", "greedy_delta"]
     for method in methods:
-        for lmbd in lambda_values:
-            config_name = f"{method}_lambda{lmbd}"
+        lambda_to_iter = lambda_values if method in methods_with_lambda else [1.0]
+        for lmbd in lambda_to_iter:
+            #normalize_to_iter = lambda_values is method in methods_with_lambda else [1.0]
+            config_name = f"{method}_lambda{lmbd}_norm{normalize_layer_quality}"
             logger.info("=" * 70)
             logger.info(f"Evaluating: {config_name}")
             logger.info("=" * 70)
@@ -680,6 +696,7 @@ def run_evaluation(
                 config_results = {
                     'method': method,
                     'lambda': lmbd,
+                    'normalize': normalize_layer_quality, 
                     'task_results': {}
                 }
 
@@ -714,6 +731,7 @@ def run_evaluation(
                             method=method,
                             layer_quality=layer_quality,
                             lmbd=lmbd,
+                            normalize_layer_quality=normalize_layer_quality,
                             batch_size=batch_size,
                             pca_cache_dir=pca_cache_dir,
                             pooling=pooling,
@@ -776,13 +794,18 @@ def main():
                        choices=["Classification", "Clustering", "PairClassification", "Reranking", "Retrieval", "STS", "Summarization"],
                        help="Filter by task type")
     parser.add_argument("--methods", type=str, nargs="+", default=["weighted"],
-                       choices=["weighted", "greedy", "greedyv2", "cluster", "concat+pca+qp", "concat+pca+cluster", "concat+pca+all", "mean", "best", "last", "weighted_best"],
+                       choices=["weighted", 'weighted_greedy', "greedy_rank", "greedy_val", "greedy_delta", 
+                       "cluster", "concat+pca+qp", "concat+pca+cluster", 
+                       "concat+pca+all", "mean", "best", "last", "weighted_best"],
                        help="Aggregation methods")
     parser.add_argument("--lambda-values", type=float, nargs="+", default=[0.5], help="Lambda values")
     parser.add_argument("--pca-cache-dir", type=str, default="./pca_cache", help="PCA cache directory")
     parser.add_argument("--num-clusters", type=int, default=4, help="Number of clusters")
     parser.add_argument("--output-dir", type=str, default="./results", help="Output directory")
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
+    parser.add_argument("--normalize-layer-quality", action="store_true", 
+                    help='if true normalize layer qualities so they sum to one')
+    
     parser.add_argument("--pooling", type=str, default="mean", choices=["mean", "cls"], help="Pooling strategy")
     parser.add_argument("--overwrite-results", action="store_true", help="Overwrite cached results")
     parser.add_argument("--max-samples", type=int, default=None, 
@@ -808,6 +831,7 @@ def main():
         methods=args.methods,
         lambda_values=args.lambda_values,
         output_dir=args.output_dir,
+        normalize_layer_quality=args.normalize_layer_quality,
         batch_size=args.batch_size,
         pca_cache_dir=args.pca_cache_dir,
         pooling=args.pooling,

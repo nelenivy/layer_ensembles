@@ -127,7 +127,7 @@ def compute_similarity_weights_greedy(
     return weights
 
 
-def compute_greedy_weights(
+def compute_greedy_weights_rank(
     similarity_matrix: np.ndarray,
     layer_quality: np.ndarray,
     lmbd: float = 0.5,
@@ -194,7 +194,7 @@ def compute_greedy_weights(
     return weights
 
 
-def compute_greedy_weights_v2(
+def compute_greedy_weights_value(
     similarity_matrix: np.ndarray,
     layer_quality: np.ndarray,
     lmbd: float = 0.5,
@@ -203,7 +203,7 @@ def compute_greedy_weights_v2(
     """
     Greedy selection with quality-based weighting (v2 from notebooks).
 
-    Similar to compute_greedy_weights but assigns weights proportional
+    Similar to _rank but assigns weights proportional
     to layer quality instead of equal weights.
 
     Args:
@@ -257,7 +257,7 @@ def compute_greedy_weights_v2(
     return weights
 
 
-def compute_greedy_weights_v3(
+def compute_greedy_weights_delta(
     similarity_matrix: np.ndarray,
     layer_quality: np.ndarray,
     lmbd: float = 0.5,
