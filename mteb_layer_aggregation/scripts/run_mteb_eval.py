@@ -776,7 +776,7 @@ def main():
                        choices=["Classification", "Clustering", "PairClassification", "Reranking", "Retrieval", "STS", "Summarization"],
                        help="Filter by task type")
     parser.add_argument("--methods", type=str, nargs="+", default=["weighted"],
-                       choices=["weighted", "greedy", "greedyv2", "cluster", "concat+pca+qp", "concat+pca+cluster", "concat+pca+all"],
+                       choices=["weighted", "greedy", "greedyv2", "cluster", "concat+pca+qp", "concat+pca+cluster", "concat+pca+all", "mean", "best", "last", "weighted_best"],
                        help="Aggregation methods")
     parser.add_argument("--lambda-values", type=float, nargs="+", default=[0.5], help="Lambda values")
     parser.add_argument("--pca-cache-dir", type=str, default="./pca_cache", help="PCA cache directory")
