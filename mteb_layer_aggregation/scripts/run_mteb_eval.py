@@ -281,7 +281,7 @@ def compute_method_weights(
     elif method == "greedyv2":
         weights = compute_greedy_weights_v2(similarity_matrix, layer_quality, lmbd)
     elif method == "mean":
-        weights = None
+        weight = np.ones(len(layer_quality))
     elif method == "last":
         weight = np.zeros(len(layer_quality))
         weight[-1] = 1
