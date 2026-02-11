@@ -276,13 +276,20 @@ def compute_method_weights(
     """Compute aggregation weights based on method."""
     if method == "weighted":
         weights = compute_similarity_weights(similarity_matrix, layer_quality, lmbd)
-        weights = normalize_weights(weights, threshold=0.001)
     elif method == "greedy":
         weights = compute_greedy_weights(similarity_matrix, layer_quality, lmbd)
-        weights = normalize_weights(weights, threshold=0.001)
     elif method == "greedyv2":
         weights = compute_greedy_weights_v2(similarity_matrix, layer_quality, lmbd)
-        weights = normalize_weights(weights, threshold=0.001)
+    elif method == "mean":
+        weights = None
+    elif method == "last":
+        weight = np.zeros(len(layer_quality))
+        weight[-1] = 1
+    elif method == "best":
+        weight = np.zeros(len(layer_quality))
+        weight[np.argmax(layer_qualities)] = 1
+    elif method == "weighted_best":
+        weight = layer_qualities
     elif method == "cluster":
         clusters = compute_layer_clusters(similarity_matrix, num_clusters)
         num_layers = similarity_matrix.shape[0]
@@ -313,7 +320,7 @@ def create_aggregated_encoder(
 ):
     """Create encoder with method-specific weights or PCA."""
 
-    if method in ["weighted", "greedy", "greedyv2", "cluster"]:
+    if method in ["weighted", "greedy", "greedyv2", "cluster", "mean", "last", "best", "weighted_best"]:
         weights = compute_method_weights(method, similarity_matrix, layer_quality, lmbd, num_clusters)
 
         encoder = AggregatedEncoder(
@@ -359,7 +366,7 @@ def create_aggregated_encoder(
             batch_size=batch_size,
             pooling=pooling,
             use_cache=use_cache, 
-            cache_dir=cache_dir   
+            cache_dir=cache_dir 
         )
 
     elif method == "concat+pca+cluster":
@@ -377,8 +384,9 @@ def create_aggregated_encoder(
                 model_name=model_name,
                 clusters=clusters,
                 cluster_weights=cluster_weights,
-                output_path=pca_path,
-                pooling=pooling
+                pooling=pooling,
+                use_cache=use_cache, 
+                cache_dir=cache_dir 
             )
         else:
             logger.info(f"Loading PCA from {pca_path}")
@@ -394,7 +402,7 @@ def create_aggregated_encoder(
             batch_size=batch_size,
             pooling=pooling,
             use_cache=use_cache, 
-            cache_dir=cache_dir   
+            cache_dir=cache_dir 
         )
 
     elif method == "concat+pca+all":
@@ -421,7 +429,7 @@ def create_aggregated_encoder(
             batch_size=batch_size,
             pooling=pooling,
             use_cache=use_cache, 
-            cache_dir=cache_dir   
+            cache_dir=cache_dir  
         )
 
     else:
@@ -816,3 +824,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
