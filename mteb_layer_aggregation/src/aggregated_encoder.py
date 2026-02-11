@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader
 from mteb.models import EncoderProtocol  
 from transformers import AutoTokenizer, AutoModel
 from src.cache_manager import EmbeddingCache
+from src.strategies import normalize_weights
 
 
 class SimpleWeightedAggregation:
@@ -19,7 +20,7 @@ class SimpleWeightedAggregation:
 
     def __init__(self, weights: np.ndarray):
         """Initialize with weights."""
-        self.weights = weights / weights.sum()  # Normalize
+        self.weights = normalize_weights(weights, threshold=0.001)
         self.weights_tensor = torch.from_numpy(self.weights).float()
 
     def aggregate(self, layer_embeddings: torch.Tensor) -> torch.Tensor:
@@ -41,7 +42,7 @@ class SimpleWeightedAggregation:
 
     def set_weights(self, weights: np.ndarray):
         """Set new weights."""
-        self.weights = weights / weights.sum()
+        self.weights = normalize_weights(weights, threshold=0.001)
         self.weights_tensor = torch.from_numpy(self.weights).float()
 
 class LayerEncoder:
@@ -256,7 +257,7 @@ class AggregatedEncoder(EncoderProtocol):
         if aggregation_weights is not None:
             initial_weights = aggregation_weights
         else:
-            initial_weights = np.ones(self.num_layers) / self.num_layers
+            initial_weights = np.ones(self.num_layers)
 
         self.aggregator = SimpleWeightedAggregation(initial_weights)
     
@@ -432,3 +433,4 @@ class AggregatedEncoder(EncoderProtocol):
 
     def __repr__(self):
         return f"AggregatedEncoder(model={self.model_name}, pooling={self.pooling}, layers={self.num_layers})"
+        
