@@ -681,8 +681,8 @@ def run_evaluation(
         return
 
     results = {}
-    methods_with_lambda = ["weighted", 'weighted_greedy', "greedy_rank", "greedy_val", "greedy_delta"]
-    methods_with_normalize = ["weighted", 'weighted_greedy', "greedy_rank", "greedy_val", "greedy_delta"]
+    methods_with_lambda = ["weighted", 'weighted_greedy', "greedy_rank", "greedy_val", "greedy_delta", "concat+pca+qp"]
+    
     for method in methods:
         lambda_to_iter = lambda_values if method in methods_with_lambda else [1.0]
         for lmbd in lambda_to_iter:
