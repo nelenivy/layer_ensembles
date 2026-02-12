@@ -297,9 +297,9 @@ def compute_method_weights(
         weights[-1] = 1
     elif method == "best":
         weights = np.zeros(len(layer_quality))
-        weights[np.argmax(layer_qualities)] = 1
+        weights[np.argmax(layer_quality)] = 1
     elif method == "weighted_best":
-        weights = layer_qualities
+        weights = layer_quality
     elif method == "cluster":
         clusters = compute_layer_clusters(similarity_matrix, num_clusters)
         num_layers = similarity_matrix.shape[0]
