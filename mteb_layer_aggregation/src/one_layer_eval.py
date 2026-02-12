@@ -90,6 +90,7 @@ class SingleLayerEncoder(EncoderProtocol):
             return None
         
         # Normalize sentences
+        print('len sentences:', len(sentences))
         sentences = [str(s).strip() for s in sentences if s is not None]
         sentences = [s for s in sentences if s]
         
@@ -180,6 +181,7 @@ class SingleLayerEncoder(EncoderProtocol):
         """Encode sentences using single layer (MTEB interface)."""
         # Handle DataLoader (MTEB 2.0 can pass this)
         if isinstance(sentences, DataLoader):
+            print("isinstance(sentences, DataLoader)")
             all_embeddings = []
             for batch in sentences:
                 batch_sentences = self._extract_sentences_from_batch(batch)
@@ -194,6 +196,7 @@ class SingleLayerEncoder(EncoderProtocol):
         
         # Handle string input
         if isinstance(sentences, str):
+            print("isinstance(sentences, str):")
             sentences = [sentences]
         
         # Handle list of sentences
@@ -202,7 +205,7 @@ class SingleLayerEncoder(EncoderProtocol):
         
         batch_size = batch_size or self.batch_size
         all_embeddings = []
-        
+        print('batch size', batch_size)
         for i in range(0, len(sentences), batch_size):
             batch = sentences[i:i + batch_size]
             batch_embs = self._encode_batch(batch)
@@ -413,7 +416,11 @@ def calculate_similarity_matrix_from_task(
 
     print("sentences", sentences[:10])
     #print(split_data)
-    
+    # Limit sentences FIRST
+    if len(sentences) > similarity_sample_size * 2:
+        sentences = sentences[:similarity_sample_size * 2]
+    if verbose >= 1:
+        print(f"Limited to {len(sentences)} sentences for similarity calculation")
     if verbose >= 1:
         print(f"Getting embeddings for all {n_layers} layers using MTEB API...")
     
@@ -434,7 +441,7 @@ def calculate_similarity_matrix_from_task(
         )
 
         # Encode sentences - will hit embedding cache!
-        layer_embs = encoder._encode_batch(sentences)
+        layer_embs = encoder.encode(sentences)
         all_layer_embeddings[layer_idx] = torch.from_numpy(layer_embs)
         # Extract sentences from the validation split
         # Encode using the encoder - handles all formats automatically
@@ -451,9 +458,6 @@ def calculate_similarity_matrix_from_task(
         #         batch_size=batch_size
         #     )
         print(len(layer_embs))
-        # Limit samples for similarity calculation
-        if len(layer_embs) > similarity_sample_size * 2:
-            layer_embs = layer_embs[:similarity_sample_size * 2]
         
         all_layer_embeddings[layer_idx] = torch.from_numpy(layer_embs)
     
