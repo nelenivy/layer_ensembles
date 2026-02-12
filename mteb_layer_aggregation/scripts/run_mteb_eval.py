@@ -21,6 +21,8 @@ import csv
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import numpy as np
+
+from scipy.special import softmax
 import torch
 import mteb
 
@@ -109,14 +111,15 @@ IMAGE_TASK_NAMES = [
 
 CORE_MTEB_TASKS = {
 # Retrieval (4)
-    "NFCorpus", "SciFact", "FiQA2018", 
+    #"NFCorpus", "SciFact", 
+    "FiQA2018", 
     #"QuoraRetrieval",#too big
     # Classification (4)
-    "Banking77Classification", "AmazonCounterfactualClassification","EmotionClassification",
+    #"Banking77Classification", "AmazonCounterfactualClassification","EmotionClassification",
     # STS (1)
-    "STSBenchmark", #"SICK-R",
+    #"STSBenchmark", #"SICK-R",
     # Pair Classification (1)
-    "SprintDuplicateQuestions",
+    #"SprintDuplicateQuestions",
     # Reranking (1)
     #"MindSmallReranking",#too big
     # # Clustering (1)
@@ -267,6 +270,30 @@ def load_similarity_matrix(path: str) -> np.ndarray:
     logger.info(f"Loaded similarity matrix with shape {matrix.shape}")
     return matrix
 
+def transform_similarity_matrix(
+    similarity_matrix: np.ndarray,
+    use_arccos: bool = False,
+    use_log_similarity: bool = False,
+    add_row_sum_to_diag: bool = False
+) -> np.ndarray:
+    """Apply transformations to similarity matrix."""
+    matrix = similarity_matrix.copy()
+    
+    if use_arccos:
+        print('APPLYING ARCCOS TO SIMILARITY MATRIX')
+        matrix = np.arccos(np.clip(matrix, -1, 1))
+    
+    if use_log_similarity:
+        print('APPLYING LOG TO SIMILARITY MATRIX')
+        matrix = np.log(np.maximum(matrix, 1e-10))
+    
+    if add_row_sum_to_diag:
+        print('ADDING ROW SUM TO DIAGONAL')
+        row_sums = matrix.sum(axis=1)
+        for i in range(matrix.shape[0]):
+            matrix[i, i] += row_sums[i]
+    
+    return matrix
 
 def compute_method_weights(
     method: str,
@@ -274,12 +301,23 @@ def compute_method_weights(
     layer_quality: np.ndarray,
     lmbd: float,
     normalize_layer_quality=False,
+    softmax_temperature: float = 1.0,
+    use_softmax: bool = False,
+    use_log_quality: bool = False,
     num_clusters: int = 4
 ) -> np.ndarray:
+    """Compute aggregation weights based on method."""
+    # Apply layer quality transformations
+    if use_softmax:
+        print(f'APPLYING SOFTMAX TO LAYER QUALITIES (temperature={softmax_temperature})')
+        layer_quality = softmax(layer_quality / softmax_temperature)
+    if use_log_quality:
+        print('APPLYING LOG TO LAYER QUALITIES')
+        layer_quality = np.log(np.maximum(layer_quality, 1e-10))
     if normalize_layer_quality:
         print('NORMALIZE LAYER QUALITIES')
         layer_quality = layer_quality / layer_quality.sum()
-    """Compute aggregation weights based on method."""
+    
     if method == "weighted":
         weights = compute_similarity_weights(similarity_matrix, layer_quality, lmbd)
     elif method == 'weighted_greedy':
@@ -297,9 +335,9 @@ def compute_method_weights(
         weights[-1] = 1
     elif method == "best":
         weights = np.zeros(len(layer_quality))
-        weights[np.argmax(layer_qualities)] = 1
+        weights[np.argmax(layer_quality)] = 1
     elif method == "weighted_best":
-        weights = layer_qualities
+        weights = layer_quality
     elif method == "cluster":
         clusters = compute_layer_clusters(similarity_matrix, num_clusters)
         num_layers = similarity_matrix.shape[0]
@@ -311,7 +349,7 @@ def compute_method_weights(
         weights = weights / weights.sum()
     else:
         raise ValueError(f"Unknown method: {method}")
-
+    
     return weights
 
 
@@ -322,26 +360,38 @@ def create_aggregated_encoder(
     layer_quality: np.ndarray,
     lmbd: float,
     normalize_layer_quality=False,
+    softmax_temperature: float = 1.0,
+    use_softmax: bool = False,
+    use_log_quality: bool = False,
+    use_arccos_similarity: bool = False,
+    use_log_similarity: bool = False,
+    add_row_sum_to_diag: bool = False,
     batch_size: int = 32,
     pca_cache_dir: str = "./pca_cache",
     pooling: str = "mean",
     num_clusters: int = 4,
-    use_cache: bool = False, 
-    cache_dir: str = "./embedding_cache"  
+    use_cache: bool = False,
+    cache_dir: str = "./embedding_cache"
 ):
     """Create encoder with method-specific weights or PCA."""
-
+    # Transform similarity matrix
+    similarity_matrix = transform_similarity_matrix(
+        similarity_matrix, use_arccos_similarity, use_log_similarity, add_row_sum_to_diag
+    )
+    
     if method in ["weighted", 'weighted_greedy', "greedy_rank", "greedy_val",
-            "greedy_delta", "cluster", "mean", "last", "best", "weighted_best"]:
-        weights = compute_method_weights(method, similarity_matrix, layer_quality, lmbd, normalize_layer_quality, num_clusters)
-
+                  "greedy_delta", "cluster", "mean", "last", "best", "weighted_best"]:
+        weights = compute_method_weights(
+            method, similarity_matrix, layer_quality, lmbd, 
+            normalize_layer_quality, softmax_temperature, use_softmax, use_log_quality, num_clusters
+        )
         encoder = AggregatedEncoder(
             model_name=model_name,
             pooling=pooling,
             batch_size=batch_size,
             aggregation_weights=weights,
-            use_cache=use_cache, 
-            cache_dir=cache_dir   
+            use_cache=use_cache,
+            cache_dir=cache_dir
         )
 
     elif method == "concat+pca+qp":
@@ -615,6 +665,7 @@ def update_results_tables(output_dir: str, config_name: str, task_name: str, mai
         logger.error(f"Failed to write Markdown table: {e}")
 
 
+
 def run_evaluation(
     model_name: str,
     similarity_matrix_path: str,
@@ -624,6 +675,12 @@ def run_evaluation(
     lambda_values: List[float],
     output_dir: str,
     normalize_layer_quality=False,
+    softmax_temperature: float = 1.0,
+    use_softmax: bool = False,
+    use_log_quality: bool = False,
+    use_arccos_similarity: bool = False,
+    use_log_similarity: bool = False,
+    add_row_sum_to_diag: bool = False,
     batch_size: int = 32,
     pca_cache_dir: str = "./pca_cache",
     pooling: str = "mean",
@@ -632,13 +689,18 @@ def run_evaluation(
     max_samples: Optional[int] = None,
     dataset_specific_task=None,
     use_embedding_cache=True,
-        use_quality_cache=True,
-        embedding_cache_dir='./embedding_cache',
-        quality_cache_dir='./quality_cache'
+    use_quality_cache=True,
+    embedding_cache_dir='./embedding_cache',
+    quality_cache_dir='./quality_cache',
+    per_dataset_similarity_metric: Optional[str] = None,
+    similarity_sample_size: int = 3000,
+    similarity_num_trials: int = 5,
+    similarity_cache_dir: str = "./similarity_cache"
 ):
-
     """Run MTEB evaluation for all method/lambda combinations."""
-    similarity_matrix = load_similarity_matrix(similarity_matrix_path)
+    if per_dataset_similarity_metric is None:
+        similarity_matrix = load_similarity_matrix(similarity_matrix_path)
+        print(similarity_matrix)
     os.makedirs(output_dir, exist_ok=True)
 
     logger.info("Loading MTEB tasks...")
@@ -682,12 +744,25 @@ def run_evaluation(
 
     results = {}
     methods_with_lambda = ["weighted", 'weighted_greedy', "greedy_rank", "greedy_val", "greedy_delta", "concat+pca+qp"]
-    
+
     for method in methods:
         lambda_to_iter = lambda_values if method in methods_with_lambda else [1.0]
         for lmbd in lambda_to_iter:
             #normalize_to_iter = lambda_values is method in methods_with_lambda else [1.0]
             config_name = f"{method}_lambda{lmbd}_norm{normalize_layer_quality}"
+            if per_dataset_similarity_metric:
+                config_name += f"_perdataset_{per_dataset_similarity_metric}"
+            if use_softmax:
+                config_name += f"_softmax{softmax_temperature}"
+            if use_log_quality:
+                config_name += "_logqual"
+            if use_arccos_similarity:
+                config_name += "_arccos"
+            if use_log_similarity:
+                config_name += "_logsim"
+            if add_row_sum_to_diag:
+                config_name += "_diagsum"
+
             logger.info("=" * 70)
             logger.info(f"Evaluating: {config_name}")
             logger.info("=" * 70)
@@ -712,32 +787,60 @@ def run_evaluation(
                     try:
                         task_to_use = task_name if (dataset_specific_task is None) else dataset_specific_task
                         logger.info(f"Computing layer quality on {task_to_use}...")
-                        layer_quality = compute_dataset_specific_layer_quality(
-                            model_name=model_name,
-                            task_name=task_to_use,
-                            pooling=pooling,
-                            batch_size=batch_size,
-                            device="cuda",
-                            verbose=1,
-                            use_cache=use_quality_cache, 
-                            cache_dir=quality_cache_dir,
-                            use_emb_cache=use_embedding_cache, 
-                            emb_cache_dir=embedding_cache_dir  
-                        )
+                        if per_dataset_similarity_metric:
+                            layer_quality, similarity_matrix_to_use = compute_dataset_specific_layer_quality(
+                                model_name=model_name,
+                                task_name=task_to_use,
+                                pooling=pooling,
+                                batch_size=batch_size,
+                                device="cuda",
+                                verbose=1,
+                                use_cache=use_quality_cache,
+                                cache_dir=quality_cache_dir,
+                                use_emb_cache=use_embedding_cache,
+                                emb_cache_dir=embedding_cache_dir,
+                                calc_similarity_matrix=True,
+                                similarity_metric=per_dataset_similarity_metric,
+                                similarity_sample_size=similarity_sample_size,
+                                similarity_num_trials=similarity_num_trials,
+                                similarity_cache_dir=similarity_cache_dir
+                            )
+                        else:
+                            layer_quality = compute_dataset_specific_layer_quality(
+                                model_name=model_name,
+                                task_name=task_to_use,
+                                pooling=pooling,
+                                batch_size=batch_size,
+                                device="cuda",
+                                verbose=1,
+                                use_cache=use_quality_cache,
+                                cache_dir=quality_cache_dir,
+                                use_emb_cache=use_embedding_cache,
+                                emb_cache_dir=embedding_cache_dir
+                            )
+                            similarity_matrix_to_use = similarity_matrix
+
                         print(layer_quality)
+                        print(similarity_matrix_to_use)
                         encoder = create_aggregated_encoder(
                             model_name=model_name,
-                            similarity_matrix=similarity_matrix,
+                            similarity_matrix=similarity_matrix_to_use,  # Use the right matrix
                             method=method,
                             layer_quality=layer_quality,
                             lmbd=lmbd,
                             normalize_layer_quality=normalize_layer_quality,
+                            softmax_temperature=softmax_temperature,
+                            use_softmax=use_softmax,
+                            use_log_quality=use_log_quality,
+                            use_arccos_similarity=use_arccos_similarity,
+                            use_log_similarity=use_log_similarity,
+                            add_row_sum_to_diag=add_row_sum_to_diag,
                             batch_size=batch_size,
                             pca_cache_dir=pca_cache_dir,
                             pooling=pooling,
                             num_clusters=num_clusters,
-                            use_cache=use_embedding_cache, 
-                            cache_dir=embedding_cache_dir 
+                            use_cache=use_embedding_cache,
+                            cache_dir=embedding_cache_dir
                         )
 
                         task_result = mteb.evaluate(
@@ -787,7 +890,7 @@ def main():
     parser = argparse.ArgumentParser(description="Run MTEB evaluation with layer aggregation methods")
 
     parser.add_argument("--model-name", type=str, required=True, help="HuggingFace model name")
-    parser.add_argument("--similarity-matrix", type=str, required=True, help="Path to similarity matrix pickle")
+    parser.add_argument("--similarity-matrix", type=str, required=False, help="Path to similarity matrix pickle", default='None')
     parser.add_argument("--tasks", type=str, nargs="+", required=True, 
                        help='Task selection: "all" (~700 tasks), "mteb-v2" (41 tasks), "core" (15 tasks), or specific task names')
     parser.add_argument("--task-types", type=str, nargs="+", default=None,
@@ -805,7 +908,18 @@ def main():
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
     parser.add_argument("--normalize-layer-quality", action="store_true", 
                     help='if true normalize layer qualities so they sum to one')
-    
+    parser.add_argument("--softmax-temperature", type=float, default=1.0,
+                        help='Temperature for softmax transformation of layer qualities')
+    parser.add_argument("--use-softmax", action="store_true",
+                        help='Apply softmax to layer qualities')
+    parser.add_argument("--use-log-quality", action="store_true",
+                        help='Apply logarithm to layer qualities')
+    parser.add_argument("--use-arccos-similarity", action="store_true",
+                        help='Apply arccos to similarity matrix')
+    parser.add_argument("--use-log-similarity", action="store_true",
+                        help='Apply logarithm to similarity matrix')
+    parser.add_argument("--add-row-sum-to-diag", action="store_true",
+                        help='Add row sum to diagonal of similarity matrix')
     parser.add_argument("--pooling", type=str, default="mean", choices=["mean", "cls"], help="Pooling strategy")
     parser.add_argument("--overwrite-results", action="store_true", help="Overwrite cached results")
     parser.add_argument("--max-samples", type=int, default=None, 
@@ -820,7 +934,15 @@ def main():
                        help="Cache layer quality scores")
     parser.add_argument("--embedding-cache-dir", type=str, default="./embedding_cache")
     parser.add_argument("--quality-cache-dir", type=str, default="./quality_cache")
-
+    parser.add_argument("--per-dataset-similarity-metric", type=str, default=None,
+                    choices=["CKA", "RSA", "JaccardSimilarity", "DistanceCorrelation"],
+                    help="Calculate similarity matrix per dataset using this metric")
+    parser.add_argument("--similarity-sample-size", type=int, default=3000,
+                        help="Number of samples per Monte Carlo trial for similarity")
+    parser.add_argument("--similarity-num-trials", type=int, default=5,
+                        help="Number of Monte Carlo trials for similarity")
+    parser.add_argument("--similarity-cache-dir", type=str, default="./similarity_cache",
+                        help="Directory to cache per-dataset similarity matrices")
     args = parser.parse_args()
 
     run_evaluation(
@@ -832,6 +954,12 @@ def main():
         lambda_values=args.lambda_values,
         output_dir=args.output_dir,
         normalize_layer_quality=args.normalize_layer_quality,
+        softmax_temperature=args.softmax_temperature,
+        use_softmax=args.use_softmax,
+        use_log_quality=args.use_log_quality,
+        use_arccos_similarity=args.use_arccos_similarity,
+        use_log_similarity=args.use_log_similarity,
+        add_row_sum_to_diag=args.add_row_sum_to_diag,
         batch_size=args.batch_size,
         pca_cache_dir=args.pca_cache_dir,
         pooling=args.pooling,
@@ -842,7 +970,11 @@ def main():
         use_embedding_cache=args.use_embedding_cache,
         use_quality_cache=args.use_quality_cache,
         embedding_cache_dir=args.embedding_cache_dir,
-        quality_cache_dir=args.quality_cache_dir
+        quality_cache_dir=args.quality_cache_dir,
+        per_dataset_similarity_metric=args.per_dataset_similarity_metric,
+        similarity_sample_size=args.similarity_sample_size,
+        similarity_num_trials=args.similarity_num_trials,
+        similarity_cache_dir=args.similarity_cache_dir
     )
 
 

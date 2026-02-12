@@ -33,7 +33,7 @@ else:
     ]
 
 setup(
-    name="layer-similarity-analysis",
+    name="layer_similarity_analysis",
     version="1.0.0",
     author="Your Name",
     author_email="your.email@example.com",
@@ -42,6 +42,7 @@ setup(
     long_description_content_type="text/markdown",
     url="https://github.com/yourusername/layer-similarity-analysis",
     packages=find_packages(),
+    #package_dir={'layer_similarity_analysis': 'src'},
     classifiers=[
         "Development Status :: 4 - Beta",
         "Intended Audience :: Science/Research",

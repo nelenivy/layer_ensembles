@@ -89,10 +89,8 @@ def compute_similarity_weights_greedy(
     n = len(layer_quality)
 
     # Create mask for valid entries
-    mask = (layer_quality != None).astype(float)
-
-    # Modify similarity matrix: set diagonal to alpha
-    A = similarity_matrix.copy()
+    mask = (layer_quality[None, :] > layer_quality[:, None]).astype(float)
+    A    = similarity_matrix * mask
     np.fill_diagonal(A, alpha)
 
     # Objective function for scipy.optimize
