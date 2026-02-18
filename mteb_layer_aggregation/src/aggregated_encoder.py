@@ -13,7 +13,7 @@ from mteb.models import EncoderProtocol
 from transformers import AutoTokenizer, AutoModel
 from src.cache_manager import EmbeddingCache
 from src.strategies import normalize_weights
-
+from types import SimpleNamespace
 
 class SimpleWeightedAggregation:
     """Simple weighted aggregation that uses provided weights."""
@@ -260,6 +260,34 @@ class AggregatedEncoder(EncoderProtocol):
             initial_weights = np.ones(self.num_layers)
 
         self.aggregator = SimpleWeightedAggregation(initial_weights)
+
+        # ✅ FIX: Create simple object with name attribute for MTEB 2.0
+        if aggregation_weights is not None:
+            import hashlib
+            weights_str = ','.join([f"{w:.4f}" for w in aggregation_weights])
+            weights_hash = hashlib.md5(weights_str.encode()).hexdigest()[:8]
+            custom_name = f"{model_name}_aggregated_{pooling}_w{weights_hash}"
+        else:
+            custom_name = f"{model_name}_aggregated_{pooling}_uniform"
+        
+        # ✅ FIX: Add all required attributes for MTEB 2.0
+        self.mteb_model_meta = SimpleNamespace(
+            name=custom_name,
+            revision="main",  # ← Add this
+            release_date=None,
+            languages=None
+        )
+
+    # In aggregated_encoder.py, find the property and add setter:
+
+    @property
+    def mteb_model_meta(self):
+        return self._mteb_model_meta
+
+    @mteb_model_meta.setter
+    def mteb_model_meta(self, value):
+        self._mteb_model_meta = value
+
     
     def _encode_batch(self, sentences: List[str]) -> np.ndarray:
         """Encode a single batch using cached layer encoder."""

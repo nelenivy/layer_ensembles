@@ -10,56 +10,117 @@ from scipy.spatial.distance import squareform
 from scipy.optimize import minimize
 from typing import List, Tuple, Optional
 
+from scipy.optimize import minimize
 
 def compute_similarity_weights(
     similarity_matrix: np.ndarray,
     layer_quality: np.ndarray,
     lmbd: float = 0.5,
-    nonnegative: bool = True
+    nonnegative: bool = True,
+    constraint=1.0,
+    nonnegative_ids=None
 ) -> np.ndarray:
     """
-    Compute layer weights using quadratic programming (standard QP).
-
-    Solves: maximize w^T quality - lambda * w^T S w
-            subject to: sum(w) = 1, w >= 0
-
-    Args:
-        similarity_matrix: (L, L) layer similarity matrix (higher = more similar)
-        layer_quality: (L,) quality score per layer
-        lmbd: Regularization strength (higher = more diversity)
-        nonnegative: Whether to enforce non-negative weights
-
-    Returns:
-        weights: (L,) normalized weights
+    Compute weights using scipy (handles non-convex objectives).
     """
     num_layers = len(layer_quality)
-
-    # Define optimization variable
-    w = cp.Variable(num_layers)
-
-    # Objective: maximize accuracy - lambda * redundancy
-    objective = cp.Maximize(
-        layer_quality @ w - lmbd * cp.quad_form(w, similarity_matrix)
-    )
-
+    
+    # Objective: minimize -(quality - lambda * redundancy)
+    def objective(w):
+        return -(layer_quality @ w - lmbd * (w @ similarity_matrix @ w))
+    
+    # Gradient for faster optimization
+    def gradient(w):
+        return -(layer_quality - 2 * lmbd * (similarity_matrix @ w))
+    
     # Constraints
-    constraints = [cp.sum(w) == 1]
-    if nonnegative:
-        constraints.append(w >= 0)
+    constraints = [
+        {'type': 'eq', 'fun': lambda w: np.sum(w) - constraint}, # sum(w) = 1,
+        {'type': 'ineq', 'fun': lambda w: - np.sum(w**2) + 1}  # sum(w**2) < 1
+    ]
+    if not(nonnegative_ids is None):
+        print(nonnegative_ids)
+        for i in range(nonnegative_ids.shape[0]):
+            if nonnegative_ids[i]:
+                constraints.append({'type': 'ineq', 'fun': lambda w: w[i]})
+    print(constraints)
+    bounds = [(0, 1)] * num_layers if nonnegative else [(-1, 1)] * num_layers
+    
+    # Initial guess: uniform or quality-weighted
+    w0 = layer_quality / layer_quality.sum()
+    
+    # Solve using SLSQP (handles nonlinear constraints)
+    result = minimize(
+        objective,
+        x0=w0,
+        method='SLSQP',
+        jac=gradient,
+        bounds=bounds,
+        constraints=constraints,
+        options={'maxiter': 1000, 'ftol': 1e-8}
+    )
+    
+    if not result.success:
+        print(f"Warning: Optimization did not converge: {result.message}")
+    print(result)
+    weights = result.x
+    weights = np.maximum(weights, 0) if nonnegative else weights
 
-    # Solve
-    problem = cp.Problem(objective, constraints)
-    problem.solve()
-
-    if problem.status not in ["optimal", "optimal_inaccurate"]:
-        raise RuntimeError(f"Optimization failed with status {problem.status}")
-
-    weights = np.asarray(w.value, dtype=np.float32)
-
-    # Ensure sum to 1 (numerical stability)
-    weights = weights / weights.sum()
-
+    if constraint > 0.0:
+        weights = weights / weights.sum() * constraint
+    
     return weights
+
+
+# def compute_similarity_weights(
+#     similarity_matrix: np.ndarray,
+#     layer_quality: np.ndarray,
+#     lmbd: float = 0.5,
+#     nonnegative: bool = True
+# ) -> np.ndarray:
+#     """
+#     Compute layer weights using quadratic programming (standard QP).
+
+#     Solves: maximize w^T quality - lambda * w^T S w
+#             subject to: sum(w) = 1, w >= 0
+
+#     Args:
+#         similarity_matrix: (L, L) layer similarity matrix (higher = more similar)
+#         layer_quality: (L,) quality score per layer
+#         lmbd: Regularization strength (higher = more diversity)
+#         nonnegative: Whether to enforce non-negative weights
+
+#     Returns:
+#         weights: (L,) normalized weights
+#     """
+#     num_layers = len(layer_quality)
+
+#     # Define optimization variable
+#     w = cp.Variable(num_layers)
+#     #dissimilarity_matrix = 1.0 - similarity_matrix
+#     # Objective: maximize accuracy - lambda * redundancy
+#     objective = cp.Maximize(
+#         layer_quality @ w - lmbd * cp.quad_form(w, similarity_matrix)
+#     )
+
+#     # Constraints
+#     constraints = [cp.sum(w) == 1]
+#     if nonnegative:
+#         constraints.append(w >= 0)
+
+#     # Solve
+#     problem = cp.Problem(objective, constraints)
+#     problem.solve()
+
+#     if problem.status not in ["optimal", "optimal_inaccurate"]:
+#         raise RuntimeError(f"Optimization failed with status {problem.status}")
+
+#     weights = np.asarray(w.value, dtype=np.float32)
+
+#     # Ensure sum to 1 (numerical stability)
+#     weights = weights / weights.sum()
+
+#     return weights
 
 
 def compute_similarity_weights_greedy(
@@ -87,7 +148,7 @@ def compute_similarity_weights_greedy(
         weights: (L,) normalized weights
     """
     n = len(layer_quality)
-
+    #dissimilarity_matrix = 1.0 - similarity_matrix
     # Create mask for valid entries
     mask = (layer_quality[None, :] > layer_quality[:, None]).astype(float)
     A    = similarity_matrix * mask
@@ -129,7 +190,7 @@ def compute_greedy_weights_rank(
     similarity_matrix: np.ndarray,
     layer_quality: np.ndarray,
     lmbd: float = 0.5,
-    max_layers: Optional[int] = None
+    max_layers: Optional[int] = 4
 ) -> np.ndarray:
     """
     Greedy layer selection with equal weights (v1 from notebooks).
@@ -196,7 +257,7 @@ def compute_greedy_weights_value(
     similarity_matrix: np.ndarray,
     layer_quality: np.ndarray,
     lmbd: float = 0.5,
-    max_layers: Optional[int] = None
+    max_layers: Optional[int] = 4
 ) -> np.ndarray:
     """
     Greedy selection with quality-based weighting (v2 from notebooks).

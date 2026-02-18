@@ -10,13 +10,18 @@ import logging
 import warnings
 from torch.utils.data import DataLoader
 from datasets import Dataset, DatasetDict
-from datasets import disable_caching
 import random
 from collections import defaultdict
 from src.cache_manager import QualityCache, EmbeddingCache
 from src.metrics.calculator import SimilarityCalculator, AVAILABLE_METRICS
 from collections.abc import Iterable
 from datasets.features.features import Value  # HuggingFace column types
+from src.aggregated_encoder import AggregatedEncoder 
+from types import SimpleNamespace
+import json
+from pathlib import Path  
+from src.fisher_constrained_optimization import fisher_gradient_descent_trust_region_efficient
+from src.validation_split_resolver import ValidationSplitResolver
 
 def split_retrieval_data(queries, corpus, qrels, val_size=0.2, seed=42, qrels_key='qrels'):
     """
@@ -83,6 +88,18 @@ class SingleLayerEncoder(EncoderProtocol):
             self.embedding_cache = EmbeddingCache(cache_dir)
         else:
             self.embedding_cache = None
+
+        if model_name:
+            custom_name = f"{model_name.replace('/', '_')}_layer{layer_idx}_{pooling}"
+        else:
+            custom_name = f"SingleLayer{layer_idx}_{pooling}"
+        
+        self.mteb_model_meta = SimpleNamespace(
+            name=custom_name,
+            revision="main",
+            release_date=None,
+            languages=None
+        )
     
     def _encode_batch(self, sentences: List[str]) -> Optional[np.ndarray]:
         """Encode batch with sentence-level caching"""
@@ -508,17 +525,22 @@ def compute_dataset_specific_layer_quality(
     verbose: int = 1,
     use_cache: bool = True, 
     cache_dir: str = "./quality_cache",
-    use_emb_cache=True, 
-    emb_cache_dir="./embs_cache",
+    use_emb_cache: bool = True, 
+    emb_cache_dir: str = "./embs_cache",
     calc_similarity_matrix: bool = False,
     similarity_metric: Optional[str] = None,
     similarity_sample_size: int = 3000,
     similarity_num_trials: int = 5,
-    similarity_cache_dir: str = "./similarity_cache"
+    similarity_cache_dir: str = "./similarity_cache",
+    calc_hessian_matrix: bool = False,
+    hessian_cache_dir: str = "./hessian_cache",
+    hessian_method: str = 'fisher', #"least_squares",  # "least_squares" or "fisher"
+    gradient_descent=False,
+    num_random_points: int = 0  # For least-squares: additional random evaluations
 ) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
     """
     Compute layer quality by evaluating each layer on a specific MTEB task with caching support.
-    Optionally calculate similarity matrix using the same task/split data.
+    Optionally calculate similarity matrix or Hessian matrix using the same task/split data.
     
     Args:
         model_name: HuggingFace model name
@@ -536,20 +558,30 @@ def compute_dataset_specific_layer_quality(
         similarity_sample_size: Samples per Monte Carlo trial
         similarity_num_trials: Number of Monte Carlo trials
         similarity_cache_dir: Similarity cache directory
+        calc_hessian_matrix: Whether to calculate Hessian matrix
+        hessian_cache_dir: Hessian cache directory
+        hessian_method: Method for Hessian ("least_squares" or "fisher")
+        num_random_points: Additional random evaluation points for least-squares
         
     Returns:
         layer_qualities: Array of shape (n_layers,) with quality scores
         OR
         (layer_qualities, similarity_matrix): Tuple if calc_similarity_matrix=True
+        OR
+        (linear_coeff, -hessian_matrix): Tuple if calc_hessian_matrix=True
+            Returns linear coefficients and negative Hessian from quadratic fit
     """
 
     # Check cache first for quality
     cached_quality = None
+    need_task_for_computation = calc_similarity_matrix or calc_hessian_matrix or gradient_descent
+    
     if use_cache:
         quality_cache = QualityCache(cache_dir)
         cached_quality = quality_cache.get(model_name, pooling, task_name)
+        
         if cached_quality is not None:
-            # If we also need similarity matrix, check its cache
+            # Check similarity cache if needed
             if calc_similarity_matrix and similarity_metric:
                 os.makedirs(similarity_cache_dir, exist_ok=True)
                 model_name_safe = model_name.replace("/", "_")
@@ -565,84 +597,57 @@ def compute_dataset_specific_layer_quality(
                         sim_data = pickle.load(f)
                     return cached_quality, sim_data['mean']
                 # Quality cached but similarity not - will compute similarity below
-            else:
+                
+            # Check Hessian cache if needed
+            elif calc_hessian_matrix:
+                os.makedirs(hessian_cache_dir, exist_ok=True)
+                model_name_safe = model_name.replace("/", "_")
+                task_name_safe = task_name.replace("/", "_")
+                
+                # Cache filename depends on method
+                if hessian_method == "fisher":
+                    hessian_cache_path = os.path.join(
+                        hessian_cache_dir,
+                        f"{model_name_safe}_{task_name_safe}_hessian_fisher_persample_{pooling}.pkl"
+                    )
+                else:  # least_squares
+                    hessian_cache_path = os.path.join(
+                        hessian_cache_dir,
+                        f"{model_name_safe}_{task_name_safe}_hessian_lsq_{pooling}.pkl"
+                    )
+                
+                if os.path.exists(hessian_cache_path):
+                    if verbose >= 1:
+                        print(f"Loading cached Hessian from {hessian_cache_path}")
+                    with open(hessian_cache_path, 'rb') as f:
+                        hessian_data = pickle.load(f)
+                    # Return linear coefficients and negative Hessian
+                    center_weights = (cached_quality == np.max(cached_quality)).astype(float)
+                    return center_weights, hessian_data['coeff'], -hessian_data['hessian']
+                
+                # ✅ FIX: Hessian not cached - DON'T return early!
+                # Fall through to load task and compute Hessian
+            
+            # Only return early if we don't need to compute anything else
+            elif not need_task_for_computation:
                 return cached_quality
 
     if verbose >= 1:
         print(f"\n{'='*70}")
-        print(f"Computing layer quality on: {task_name}")
+        if cached_quality is not None:
+            print(f"Layer quality cached. Loading task for {task_name} to compute Hessian/similarity...")
+        else:
+            print(f"Computing layer quality on: {task_name}")
         print(f"{'='*70}\n")
     
     # Load task
-    val_splits = ['dev', 'validation', 'val']
-    # Disable caching globally
-    disable_caching()
-    task = None
-    for split_name in val_splits:
-        try:
-            print(split_name)
-            print(1)
-            task = mteb.get_task(task_name, languages=['eng'], eval_splits=[split_name], exclusive_language_filter=True)
-            print(2)
-            task.load_data()
-            print(3)
-            break
-        except:
-            task = None
-            
-    if task is None:
-        task = mteb.get_task(task_name, languages=['eng'], eval_splits=['train'])
-        task.load_data()
-    task_type = task.metadata.type
-    # Loads the dataset from HuggingFace
-    dataset_to_use = task.dataset['default'] if 'default' in task.dataset else task.dataset
-    dataset_to_use = dataset_to_use['en'] if 'en' in dataset_to_use else dataset_to_use
-    dataset_to_use = dataset_to_use['default'] if 'default' in dataset_to_use else dataset_to_use
-    val_name = None
-    
-    for split_name in val_splits:
-        if split_name in dataset_to_use:
-            val_name = split_name
-            print("!!!!!!!!!!!!!!!!!! found!!!!!!!!!!!!!!!!!")
+    resolver = ValidationSplitResolver(task_name, verbose=verbose)
 
-    if val_name is None:
-        print("!!!!!!!!!!!!!!!!!!NOT found!!!!!!!!!!!!!!!!!")
-        print(list(dataset_to_use.keys()))
-        # Monkey-patch the task's dataset
-        print(task_type)
-        if task_type == "Classification":
-            print('for classification')
-            trainval = dataset_to_use['train'].train_test_split(test_size=0.2, seed=42)
-            dataset_to_use['train'] = trainval['train']
-            dataset_to_use['validation'] = trainval['test']
-            val_name = 'validation'
-        else:
-            val_name = 'train'
-        # if type(dataset_to_use['train']) is dict:
-        #     print(list(dataset_to_use['train'].keys()))
-        #     #retrieval tasks
-        #     # Determine qrels key name
-        #     qrels_key = None
-        #     if 'qrels' in dataset_to_use['train']:
-        #         qrels_key = 'qrels'
-        #     elif 'relevant_docs' in dataset_to_use['train']:
-        #         qrels_key = 'relevant_docs'
-        #     else:
-        #         raise ValueError(f"Cannot find qrels/relevant_docs in {keys}")
-        #     # Then use the split function above
-        #     trainval = split_retrieval_data(
-        #         dataset_to_use['train']['queries'],
-        #         dataset_to_use['train']['corpus'],
-        #         dataset_to_use['train'][qrels_key],
-        #         qrels_key=qrels_key
-        #     )
-                
-    task.__dict__['_eval_splits'] = [val_name]
-    # SIMPLE FIX: Set n_experiments directly if it's a classification task
-    if hasattr(task, 'n_experiments'):
-        if verbose >= 2:
-            print(f"  Setting n_experiments={1} (was {task.n_experiments})")
-        task.n_experiments = 1
+    # Access any property; loading happens only on the first call.
+    val_name     = resolver.val_name     # triggers load once
+    dataset      = resolver.dataset
+    task_type    = resolver.task_type
+    
     # Load model once for all layers
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
     model = AutoModel.from_pretrained(
@@ -653,14 +658,12 @@ def compute_dataset_specific_layer_quality(
     n_layers = model.config.num_hidden_layers + 1  # +1 for embedding layer
     layer_qualities = []
     
-    if verbose >= 1:
-        print(f"Evaluating {n_layers} layers...")
-    # Temporarily suppress MTEB logging
-    # Suppress warnings
+    # Evaluate each layer (only if not cached)
     if cached_quality is None:
+        if verbose >= 1:
+            print(f"Evaluating {n_layers} layers...")
+        
         with warnings.catch_warnings():
-            #warnings.filterwarnings('ignore', category=FutureWarning)
-            #warnings.filterwarnings('ignore', category=UserWarning)
             # Suppress all MTEB-related and HTTP logging
             loggers_to_suppress = [
                 'mteb', 
@@ -697,37 +700,27 @@ def compute_dataset_specific_layer_quality(
                 )
 
                 # Evaluate on MTEB task
-                #try:
                 results = mteb.evaluate(
                     model=encoder,
-                    #eval_splits=[val_name],
                     tasks=[task],
-                    # Remove eval_splits - it's passed via task or results extraction
                     encode_kwargs={"batch_size": batch_size},
                     show_progress_bar=False,
-                    overwrite_strategy="always"  #'only-missing'
+                    overwrite_strategy="always"
                 )
 
                 # Extract main score for the requested split
-                # results is a list of TaskResult objects
                 task_result = results[0]
-
-                # Try to get the requested split, fallback to available splits
                 scores = task_result.scores[val_name][0]
                 quality = scores.get('main_score', 0.0)
                 layer_qualities.append(quality)
                 
                 if verbose >= 1:
                     print(f"{quality:.4f}")
-                        
-                # except Exception as e:
-                #     if verbose >= 1:
-                #         print(f"ERROR: {e}")
-                #     layer_qualities.append(0.0)
             
-        # Restore original logging levels
-        for logger_name, level in original_levels.items():
-            logging.getLogger(logger_name).setLevel(level)
+            # Restore original logging levels
+            for logger_name, level in original_levels.items():
+                logging.getLogger(logger_name).setLevel(level)
+        
         layer_qualities = np.array(layer_qualities, dtype=np.float32)
         
         if verbose >= 1:
@@ -740,17 +733,20 @@ def compute_dataset_specific_layer_quality(
             quality_cache.set(model_name, pooling, task_name, layer_qualities)
     else:
         layer_qualities = cached_quality
+        if verbose >= 1:
+            print(f"\nUsing cached layer qualities")
+            print(f"Best layer: {np.argmax(layer_qualities)} (score: {np.max(layer_qualities):.4f})")
+            print(f"Mean quality: {np.mean(layer_qualities):.4f}")
         
     # Calculate similarity matrix if requested
-    # At this point we have: model, tokenizer, task, dataset_to_use, val_name, n_layers
     if calc_similarity_matrix and similarity_metric:
         similarity_matrix = calculate_similarity_matrix_from_task(
             model=model,
             tokenizer=tokenizer,
             model_name=model_name,
-            task_name=task_name,
-            dataset_to_use=dataset_to_use,
-            val_name=val_name,
+            task_name=resolver.task_name,
+            dataset_to_use=resolver.dataset,
+            val_name=resolver.val_name,
             n_layers=n_layers,
             similarity_metric=similarity_metric,
             pooling=pooling,
@@ -764,5 +760,1091 @@ def compute_dataset_specific_layer_quality(
             verbose=verbose
         )
         return layer_qualities, similarity_matrix
+    
+    # Calculate Hessian matrix if requested
+    if gradient_descent:
+        weights, quality_hist, weight_hist = fisher_gradient_descent_trust_region_efficient(
+            model_name=model_name,
+            dataset_resolver=resolver,
+            n_layers=n_layers,
+            layer_qualities=layer_qualities,
+            max_steps=5,
+            verbose=2
+        )
 
+        return weights
+    if calc_hessian_matrix:
+        if hessian_method == "least_squares":
+            c, coeff, hessian_matrix = calculate_hessian_matrix_lsq(
+                model_name=model_name,
+                task=resolver.task,
+                task_name=resolver.task_name,
+                dataset_to_use=resolver.dataset,
+                val_name=resolver.val_name,
+                n_layers=n_layers,
+                layer_qualities=layer_qualities,
+                pooling=pooling,
+                batch_size=batch_size,
+                device=device,
+                hessian_cache_dir=hessian_cache_dir,
+                use_emb_cache=use_emb_cache,
+                emb_cache_dir=emb_cache_dir,
+                verbose=verbose,
+                num_random_points=num_random_points
+            )
+        elif hessian_method == "fisher":
+            c, coeff, hessian_matrix = calculate_hessian_matrix_fisher(
+                model_name=model_name,
+                task=resolver.task,
+                task_name=resolver.task_name,
+                dataset_to_use=resolver.dataset,
+                val_name=resolver.val_name,
+                n_layers=n_layers,
+                layer_qualities=layer_qualities,
+                pooling=pooling,
+                batch_size=batch_size,
+                device=device,
+                hessian_cache_dir=hessian_cache_dir,
+                use_emb_cache=use_emb_cache,
+                emb_cache_dir=emb_cache_dir,
+                verbose=verbose
+            )
+        else:
+            raise ValueError(f"Unknown hessian_method: {hessian_method}. Use 'least_squares' or 'fisher'")
+        
+        # Return linear coefficients and negative Hessian
+        # (don't return constant c)
+        return c, coeff, -hessian_matrix
+    
+    # Default: just return layer qualities
     return layer_qualities
+
+
+
+
+def calculate_hessian_matrix(
+    model_name: str,
+    task,
+    task_name: str,
+    dataset_to_use: Dict,
+    val_name: str,
+    n_layers: int,
+    layer_qualities: np.ndarray,
+    pooling: str = "mean",
+    batch_size: int = 32,
+    device: str = "cuda",
+    hessian_cache_dir: str = "./hessian_cache",
+    use_emb_cache: bool = True,
+    emb_cache_dir: str = "./embs_cache",
+    verbose: int = 1
+) -> np.ndarray:
+    """
+    Calculate Hessian matrix of ensemble error using finite differences.
+    Uses the existing AggregatedEncoder class.
+
+    The error function is: err = f(w1, w2, ..., wn)
+    where ensemble = sum_i wi * emb_i
+
+    We evaluate at:
+    - Individual layers: (1, 0, 0, ..., 0), (0, 1, 0, ..., 0), etc. [already have these]
+    - Pairwise combinations: (0.5, 0.5, 0, ..., 0) for all pairs (i, j)
+
+    Then compute Hessian using finite differences:
+    H_ij ≈ [f(0.5*e_i + 0.5*e_j) - f(e_i) - f(e_j) + f(0)] / (0.5 * 0.5)
+
+    For diagonal elements:
+    H_ii ≈ [f(e_i) - 2*f(0.5*e_i) + f(0)] / (0.5)²
+
+    Args:
+        model_name: Model name
+        task: MTEB task object
+        task_name: Task name for caching
+        dataset_to_use: Dataset dict
+        val_name: Validation split name
+        n_layers: Number of layers
+        layer_qualities: Quality scores for individual layers (shape: n_layers)
+        pooling: Pooling strategy
+        batch_size: Batch size for encoding
+        device: Device for computation
+        hessian_cache_dir: Cache directory for Hessian matrices
+        use_emb_cache: Whether to use embedding cache
+        emb_cache_dir: Embedding cache directory
+        verbose: Verbosity level
+
+    Returns:
+        hessian_matrix: Array of shape (n_layers, n_layers)
+    """
+
+    # Check cache first
+    os.makedirs(hessian_cache_dir, exist_ok=True)
+    model_name_safe = model_name.replace("/", "_")
+    task_name_safe = task_name.replace("/", "_")
+    hessian_cache_path = os.path.join(
+        hessian_cache_dir,
+        f"{model_name_safe}_{task_name_safe}_hessian_{pooling}.pkl"
+    )
+
+    if os.path.exists(hessian_cache_path):
+        if verbose >= 1:
+            print(f"\nLoading cached Hessian matrix from {hessian_cache_path}")
+        with open(hessian_cache_path, 'rb') as f:
+            hessian_data = pickle.load(f)
+        return hessian_data['hessian']
+
+    if task is None:
+        return None
+    if verbose >= 1:
+        print(f"\nCalculating Hessian matrix for {task_name}...")
+        print(f"Evaluating ensemble at pairwise layer combinations...")
+
+    # Convert layer_qualities to error (assuming higher quality = lower error)
+    # Error = 1 - quality
+    f_single = layer_qualities  # f(e_i) for each layer i
+    #center point, equal weights
+    encoder = AggregatedEncoder(
+                    model_name=model_name,
+                    pooling=pooling,
+                    batch_size=batch_size,
+                    device=device,
+                    aggregation_weights=np.ones(n_layers) / n_layers,
+                    use_cache=use_emb_cache,
+                    cache_dir=emb_cache_dir
+                )
+
+    # Evaluate on MTEB task
+    results = mteb.evaluate(
+        model=encoder,
+        tasks=[task],
+        encode_kwargs={"batch_size": batch_size},
+        show_progress_bar=False,
+        overwrite_strategy="always"
+    )
+    # Extract quality score
+    task_result = results[0]
+    scores = task_result.scores[val_name][0]
+    quality = scores.get('main_score', 0.0)
+    f_zero = quality  # f(mean point) 
+
+    # Evaluate at pairwise combinations: 0.5 * layer_i + 0.5 * layer_j
+    pairwise_errors = np.zeros((n_layers, n_layers))
+
+    # Suppress logging
+    with warnings.catch_warnings():
+        loggers_to_suppress = ['mteb', 'datasets', 'transformers', 'httpx', 'urllib3', 'filelock', 'huggingface_hub']
+        original_levels = {}
+        for logger_name in loggers_to_suppress:
+            logger = logging.getLogger(logger_name)
+            original_levels[logger_name] = logger.level
+            logger.setLevel(logging.INFO)
+
+        total_pairs = n_layers * (n_layers + 1) // 2  # Including diagonal
+        pair_count = 0
+
+        for i in range(n_layers):
+            for j in range(i, n_layers):
+                pair_count += 1
+                if verbose >= 1:
+                    print(f"  Pair {pair_count}/{total_pairs}: layers ({i}, {j})...", end=" ", flush=True)
+
+                # Create weight vector
+                if i == j:
+                    # Diagonal: evaluate at 0.5 * e_i
+                    weights = np.zeros(n_layers)
+                    weights[i] = 0.5
+                else:
+                    # Off-diagonal: evaluate at 0.5 * e_i + 0.5 * e_j
+                    weights = np.zeros(n_layers)
+                    weights[i] = 0.5
+                    weights[j] = 0.5
+
+                # Create aggregated encoder with these weights
+
+                encoder = AggregatedEncoder(
+                    model_name=model_name,
+                    pooling=pooling,
+                    batch_size=batch_size,
+                    device=device,
+                    aggregation_weights=weights,
+                    use_cache=use_emb_cache,
+                    cache_dir=emb_cache_dir
+                )
+
+                # Evaluate on MTEB task
+                results = mteb.evaluate(
+                    model=encoder,
+                    tasks=[task],
+                    encode_kwargs={"batch_size": batch_size},
+                    show_progress_bar=False,
+                    overwrite_strategy="always"
+                )
+
+                # Extract quality score
+                task_result = results[0]
+                scores = task_result.scores[val_name][0]
+                quality = scores.get('main_score', 0.0)
+                error = 1.0 - quality  # Convert to error
+
+                pairwise_errors[i, j] = quality
+                pairwise_errors[j, i] = quality  # Symmetric
+
+                if verbose >= 1:
+                    print(f"error: {quality:.4f}")
+
+        # Restore logging levels
+        for logger_name, level in original_levels.items():
+            logging.getLogger(logger_name).setLevel(level)
+
+    # Calculate Hessian using finite differences
+    hessian = np.zeros((n_layers, n_layers))
+    h = 0.5  # Step size
+
+    for i in range(n_layers):
+        for j in range(i, n_layers):
+            if i == j:
+                # Diagonal element: H_ii = [f(e_i) - 2*f(0.5*e_i) + f(0)] / h²
+                H_ii = (f_single[i] - 2 * pairwise_errors[i, i] + f_zero) / (h ** 2)
+                hessian[i, i] = H_ii
+            else:
+                # Off-diagonal element: H_ij = [f(0.5*e_i + 0.5*e_j) - f(e_i) - f(e_j) + f(0)] / (h * h)
+                H_ij = (pairwise_errors[i, j] - f_single[i] - f_single[j] + f_zero) / (h * h)
+                hessian[i, j] = H_ij
+                hessian[j, i] = H_ij  # Symmetric
+
+    # Cache the Hessian matrix
+    cache_data = {
+        'hessian': hessian,
+        'pairwise_errors': pairwise_errors,
+        'task_name': task_name,
+        'model_name': model_name,
+        'pooling': pooling
+    }
+
+    with open(hessian_cache_path, 'wb') as f:
+        pickle.dump(cache_data, f)
+
+    if verbose >= 1:
+        print(f"\nCached Hessian matrix to {hessian_cache_path}")
+        print(f"Hessian matrix shape: {hessian.shape}")
+        print(f"Hessian stats: mean={hessian.mean():.4f}, std={hessian.std():.4f}")
+        print(f"Hessian diagonal: {np.diag(hessian)}")
+
+    return hessian
+
+
+def calculate_matrix_least_squares(
+    model_name: str,
+    task,
+    task_name: str,
+    dataset_to_use: Dict,
+    val_name: str,
+    n_layers: int,
+    layer_qualities: np.ndarray,
+    pooling: str = "mean",
+    batch_size: int = 32,
+    device: str = "cuda",
+    hessian_cache_dir: str = "./hessian_cache",
+    use_emb_cache: bool = True,
+    emb_cache_dir: str = "./embs_cache",
+    verbose: int = 1,
+    num_random_points: int = 0  # Additional random evaluation points
+) -> Tuple[float, np.ndarray, np.ndarray]:
+    """
+    Calculate Hessian matrix by fitting a second-order polynomial to ensemble quality.
+    
+    Fits: quality = c + w·coeff + w^T·H·w
+    where w are normalized layer weights (sum to 1)
+    
+    Evaluation points:
+    - Individual layers: e_i = (0,...,1,...,0) [n points]
+    - Pairwise: 0.5*e_i + 0.5*e_j [n(n-1)/2 points]
+    - Uniform: (1/n,...,1/n) [1 point]
+    - Random: additional random simplex points [num_random_points]
+    
+    Args:
+        ... (same as before)
+        num_random_points: Number of additional random evaluation points
+        
+    Returns:
+        c: Constant term (baseline quality)
+        coeff: Linear coefficients, shape (n_layers,)
+        H: Hessian matrix, shape (n_layers, n_layers)
+    """
+    
+    # Check cache first
+    os.makedirs(hessian_cache_dir, exist_ok=True)
+    model_name_safe = model_name.replace("/", "_")
+    task_name_safe = task_name.replace("/", "_")
+    hessian_cache_path = os.path.join(
+        hessian_cache_dir,
+        f"{model_name_safe}_{task_name_safe}_hessian_lsq_{pooling}.pkl"
+    )
+    
+    if os.path.exists(hessian_cache_path):
+        if verbose >= 1:
+            print(f"\nLoading cached Hessian from {hessian_cache_path}")
+        with open(hessian_cache_path, 'rb') as f:
+            cached = pickle.load(f)
+        return cached['c'], cached['coeff'], cached['hessian']
+    
+    if task is None:
+        return None, None, None
+    
+    if verbose >= 1:
+        print(f"\nCalculating Hessian via least-squares fitting for {task_name}...")
+    
+    # Collect evaluation points and their qualities
+    eval_points = []  # List of weight vectors
+    eval_qualities = []  # List of quality scores
+    
+    # Suppress logging
+    with warnings.catch_warnings():
+        loggers_to_suppress = ['mteb', 'datasets', 'transformers', 'httpx', 'urllib3', 'filelock', 'huggingface_hub']
+        original_levels = {}
+        for logger_name in loggers_to_suppress:
+            logger = logging.getLogger(logger_name)
+            original_levels[logger_name] = logger.level
+            logger.setLevel(logging.INFO)
+        
+        # 1. Individual layers (already computed - use layer_qualities)
+        if verbose >= 1:
+            print(f"\n1. Using individual layer qualities ({n_layers} points)")
+        
+        for i in range(n_layers):
+            weights = np.zeros(n_layers)
+            weights[i] = 1.0
+            eval_points.append(weights)
+            eval_qualities.append(layer_qualities[i])
+        
+        # 2. Uniform weights
+        if verbose >= 1:
+            print(f"2. Evaluating uniform weights (1 point)")
+        
+        uniform_weights = np.ones(n_layers) / n_layers
+        encoder = AggregatedEncoder(
+            model_name=model_name,
+            pooling=pooling,
+            batch_size=batch_size,
+            device=device,
+            aggregation_weights=uniform_weights,
+            use_cache=use_emb_cache,
+            cache_dir=emb_cache_dir
+        )
+        results = mteb.evaluate(
+            model=encoder,
+            tasks=[task],
+            encode_kwargs={"batch_size": batch_size},
+            show_progress_bar=False,
+            overwrite_strategy="always"
+        )
+        task_result = results[0]
+        scores = task_result.scores[val_name][0]
+        uniform_quality = scores.get('main_score', 0.0)
+        
+        eval_points.append(uniform_weights)
+        eval_qualities.append(uniform_quality)
+        
+        if verbose >= 1:
+            print(f"   Uniform quality: {uniform_quality:.4f}")
+        
+        # 3. Pairwise combinations: normalized (0.5, 0.5) pairs
+        num_pairs = n_layers * (n_layers - 1) // 2
+        if verbose >= 1:
+            print(f"3. Evaluating pairwise combinations ({num_pairs} points)")
+        
+        pair_count = 0
+        for i in range(n_layers):
+            for j in range(i + 1, n_layers):
+                pair_count += 1
+                if verbose >= 1:
+                    print(f"   Pair {pair_count}/{num_pairs}: layers ({i}, {j})...", end=" ", flush=True)
+                
+                # Create normalized weight vector
+                weights = np.zeros(n_layers)
+                weights[i] = 0.5
+                weights[j] = 0.5
+                # Already sums to 1!
+                
+                encoder = AggregatedEncoder(
+                    model_name=model_name,
+                    pooling=pooling,
+                    batch_size=batch_size,
+                    device=device,
+                    aggregation_weights=weights,
+                    use_cache=use_emb_cache,
+                    cache_dir=emb_cache_dir
+                )
+                
+                results = mteb.evaluate(
+                    model=encoder,
+                    tasks=[task],
+                    encode_kwargs={"batch_size": batch_size},
+                    show_progress_bar=False,
+                    overwrite_strategy="always"
+                )
+                
+                task_result = results[0]
+                scores = task_result.scores[val_name][0]
+                quality = scores.get('main_score', 0.0)
+                
+                eval_points.append(weights)
+                eval_qualities.append(quality)
+                
+                if verbose >= 1:
+                    print(f"quality: {quality:.4f}")
+        
+        # 4. Random simplex points (optional)
+        if num_random_points > 0:
+            if verbose >= 1:
+                print(f"4. Evaluating random simplex points ({num_random_points} points)")
+            
+            np.random.seed(42)
+            for r in range(num_random_points):
+                # Sample from simplex using Dirichlet distribution
+                weights = np.random.dirichlet(np.ones(n_layers))
+                
+                if verbose >= 1:
+                    print(f"   Random {r+1}/{num_random_points}...", end=" ", flush=True)
+                
+                encoder = AggregatedEncoder(
+                    model_name=model_name,
+                    pooling=pooling,
+                    batch_size=batch_size,
+                    device=device,
+                    aggregation_weights=weights,
+                    use_cache=use_emb_cache,
+                    cache_dir=emb_cache_dir
+                )
+                
+                results = mteb.evaluate(
+                    model=encoder,
+                    tasks=[task],
+                    encode_kwargs={"batch_size": batch_size},
+                    show_progress_bar=False,
+                    overwrite_strategy="always"
+                )
+                
+                task_result = results[0]
+                scores = task_result.scores[val_name][0]
+                quality = scores.get('main_score', 0.0)
+                
+                eval_points.append(weights)
+                eval_qualities.append(quality)
+                
+                if verbose >= 1:
+                    print(f"quality: {quality:.4f}")
+        
+        # Restore logging levels
+        for logger_name, level in original_levels.items():
+            logging.getLogger(logger_name).setLevel(level)
+    
+    # Convert to numpy arrays
+    eval_points = np.array(eval_points)  # Shape: (num_points, n_layers)
+    eval_qualities = np.array(eval_qualities)  # Shape: (num_points,)
+    
+    num_points = len(eval_points)
+    if verbose >= 1:
+        print(f"\nFitting quadratic model to {num_points} evaluation points...")
+        print(f"Quality range: [{eval_qualities.min():.4f}, {eval_qualities.max():.4f}]")
+    
+    # Build design matrix for least squares
+    # Model: quality = c + sum_i(coeff_i * w_i) + sum_i sum_j (H_ij * w_i * w_j)
+    # Number of parameters: 1 (c) + n (coeff) + n(n+1)/2 (H, symmetric)
+    
+    num_params = 1 + n_layers + n_layers * (n_layers + 1) // 2
+    X = np.zeros((num_points, num_params))
+    
+    for point_idx in range(num_points):
+        w = eval_points[point_idx]
+        col_idx = 0
+        
+        # Constant term
+        X[point_idx, col_idx] = 1.0
+        col_idx += 1
+        
+        # Linear terms: w_i
+        for i in range(n_layers):
+            X[point_idx, col_idx] = w[i]
+            col_idx += 1
+        
+        # Quadratic terms: w_i * w_j (symmetric, store upper triangle)
+        for i in range(n_layers):
+            for j in range(i, n_layers):
+                X[point_idx, col_idx] = w[i] * w[j]
+                col_idx += 1
+    
+    # Solve least squares: X * params = eval_qualities
+    params, residuals, rank, s = np.linalg.lstsq(X, eval_qualities, rcond=None)
+    
+    # Extract parameters
+    col_idx = 0
+    
+    # Constant
+    c = params[col_idx]
+    col_idx += 1
+    
+    # Linear coefficients
+    coeff = params[col_idx:col_idx + n_layers]
+    col_idx += n_layers
+    
+    # Hessian (symmetric)
+    H = np.zeros((n_layers, n_layers))
+    for i in range(n_layers):
+        for j in range(i, n_layers):
+            H[i, j] = params[col_idx]
+            H[j, i] = params[col_idx]
+            col_idx += 1
+    
+    # Compute R² and RMSE for diagnostics
+    predictions = X @ params
+    ss_res = np.sum((eval_qualities - predictions) ** 2)
+    ss_tot = np.sum((eval_qualities - eval_qualities.mean()) ** 2)
+    r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+    rmse = np.sqrt(ss_res / num_points)
+    
+    if verbose >= 1:
+        print(f"\nLeast squares fitting results:")
+        print(f"  R² = {r_squared:.6f}")
+        print(f"  RMSE = {rmse:.6f}")
+        print(f"  Constant c = {c:.6f}")
+        print(f"  Linear coeff range: [{coeff.min():.6f}, {coeff.max():.6f}]")
+        print(f"  Hessian H range: [{H.min():.6f}, {H.max():.6f}]")
+        print(f"  Hessian diagonal: {np.diag(H)}")
+    
+    # Cache the results
+    cache_data = {
+        'c': c,
+        'coeff': coeff,
+        'hessian': H,
+        'eval_points': eval_points,
+        'eval_qualities': eval_qualities,
+        'r_squared': r_squared,
+        'rmse': rmse,
+        'task_name': task_name,
+        'model_name': model_name,
+        'pooling': pooling
+    }
+    
+    with open(hessian_cache_path, 'wb') as f:
+        pickle.dump(cache_data, f)
+    
+    if verbose >= 1:
+        print(f"\nCached Hessian to {hessian_cache_path}")
+    
+    return c, coeff, H
+
+
+def calculate_hessian_matrix_fisher(
+    model_name: str,
+    task,
+    task_name: str,
+    dataset_to_use: Dict,
+    val_name: str,
+    n_layers: int,
+    layer_qualities: np.ndarray,
+    pooling: str = "mean",
+    batch_size: int = 32,
+    device: str = "cuda",
+    hessian_cache_dir: str = "./hessian_cache",
+    use_emb_cache: bool = True,
+    emb_cache_dir: str = "./embs_cache",
+    verbose: int = 1,
+    perturbation_size: float = 0.1,
+    num_samples: int = 1000
+) -> Tuple[float, np.ndarray, np.ndarray]:
+    """
+    Calculate TRUE Fisher Information Matrix using per-sample gradients.
+    
+    Fisher approximation:
+    1. Evaluate at center (best layer)
+    2. Get per-sample scores at center
+    3. For each layer, perturb and get per-sample scores
+    4. Compute per-sample gradients: ∂log L(x)/∂w_i for each sample x
+    5. Fisher = Covariance of per-sample gradients across samples
+    6. Hessian ≈ -Fisher (for maximization)
+    
+    Cost: O(n) evaluations + per-sample prediction parsing
+    
+    Returns:
+        c: Log-likelihood at center
+        coeff: Average gradient (linear coefficient)
+        H: Hessian = -Fisher
+    """
+    
+    # Check cache
+    os.makedirs(hessian_cache_dir, exist_ok=True)
+    model_name_safe = model_name.replace("/", "_")
+    task_name_safe = task_name.replace("/", "_")
+    hessian_cache_path = os.path.join(
+        hessian_cache_dir,
+        f"{model_name_safe}_{task_name_safe}_hessian_fisher_persample_{pooling}.pkl"
+    )
+    
+    if os.path.exists(hessian_cache_path):
+        if verbose >= 1:
+            print(f"\nLoading cached Fisher-Hessian (per-sample) from {hessian_cache_path}")
+        with open(hessian_cache_path, 'rb') as f:
+            cached = pickle.load(f)
+        return cached['c'], cached['coeff'], cached['hessian']
+    
+    if task is None:
+        return None, None, None
+    
+    if verbose >= 1:
+        print(f"\n{'='*70}")
+        print(f"TRUE Fisher Information Matrix (per-sample gradients)")
+        print(f"{'='*70}")
+    
+    # Find best layer as center
+    best_layer_idx = np.argmax(layer_qualities)
+    center_weights = np.zeros(n_layers)
+    center_weights[best_layer_idx] = 1.0
+    
+    if verbose >= 1:
+        print(f"Center: best layer {best_layer_idx} (quality: {layer_qualities[best_layer_idx]:.4f})")
+    
+    # Create prediction directory
+    prediction_base_dir = os.path.join(hessian_cache_dir, "fisher_predictions")
+    os.makedirs(prediction_base_dir, exist_ok=True)
+    
+    # Suppress logging
+    with warnings.catch_warnings():
+        loggers_to_suppress = ['mteb', 'datasets', 'transformers', 'httpx', 
+                               'urllib3', 'filelock', 'huggingface_hub']
+        original_levels = {}
+        for logger_name in loggers_to_suppress:
+            logger = logging.getLogger(logger_name)
+            original_levels[logger_name] = logger.level
+            logger.setLevel(logging.INFO)
+        
+        # Step 1: Evaluate at center and get per-sample scores
+        if verbose >= 1:
+            print(f"\n1. Evaluating at center (best layer {best_layer_idx})...")
+        
+        encoder_center = AggregatedEncoder(
+            model_name=model_name,
+            pooling=pooling,
+            batch_size=batch_size,
+            device=device,
+            aggregation_weights=center_weights,
+            use_cache=use_emb_cache,
+            cache_dir=emb_cache_dir
+        )
+        
+        prediction_dir_center = os.path.join(prediction_base_dir, "center")
+        os.makedirs(prediction_dir_center, exist_ok=True)
+        # In calculate_hessian_matrix_fisher, when calling mteb.evaluate:
+        print(encoder_center,task,batch_size, prediction_dir_center)
+        results_center = mteb.evaluate(
+            model=encoder_center,
+            tasks=[task],
+            encode_kwargs={"batch_size": batch_size},
+            prediction_folder=prediction_dir_center,
+            show_progress_bar=False,
+            overwrite_strategy="always"
+        )
+        
+        task_result = results_center[0]
+        scores = task_result.scores[val_name][0]
+        quality_center = scores.get('main_score', 0.0)
+        
+        # Extract per-sample scores from predictions
+        per_sample_scores_center = load_per_sample_scores_from_predictions(
+            prediction_dir_center, task, task_name, val_name, dataset_to_use
+        )
+        
+        if verbose >= 1:
+            print(f"   Aggregate quality: {quality_center:.4f}")
+            print(f"   Per-sample scores extracted: {len(per_sample_scores_center)} samples")
+            print(f"   Per-sample score range: [{per_sample_scores_center.min():.4f}, {per_sample_scores_center.max():.4f}]")
+        
+        # Subsample if needed
+        num_samples_actual = len(per_sample_scores_center)
+        # if num_samples > 0 and num_samples < num_samples_actual:
+        #     indices = np.random.choice(num_samples_actual, num_samples, replace=False)
+        #     per_sample_scores_center = per_sample_scores_center[indices]
+        #     if verbose >= 1:
+        #         print(f"   Subsampled to {num_samples} samples")
+        # else:
+        num_samples = num_samples_actual
+        
+        # Normalize per-sample scores to probabilities
+        per_sample_probs_center = per_sample_scores_center #/ per_sample_scores_center.sum()
+        per_sample_log_L_center = np.log(np.maximum(per_sample_probs_center, 1e-10))
+        print(per_sample_log_L_center)
+        c = np.mean(per_sample_log_L_center)  # Average log-likelihood
+        
+        if verbose >= 1:
+            print(f"   Average log-likelihood: {c:.4f}")
+        
+        # Step 2: For each layer, perturb and compute per-sample gradients
+        if verbose >= 1:
+            print(f"\n2. Computing per-sample gradients ({n_layers} perturbations):")
+        
+        per_sample_gradients = []  # Will be shape (n_layers, num_samples)
+        
+        for i in range(n_layers):
+            if verbose >= 1:
+                print(f"   [{i+1}/{n_layers}] Layer {i}...", end=" ", flush=True)
+            
+            if i == best_layer_idx:
+                # At center - gradient is zero
+                gradient_i = np.zeros(num_samples)
+                per_sample_gradients.append(gradient_i)
+                if verbose >= 1:
+                    print(f"(at center, gradient=0)")
+                continue
+            
+            # Perturb toward layer i
+            target_weights = np.zeros(n_layers)
+            target_weights[i] = 1.0
+            perturbed_weights = (1 - perturbation_size) * center_weights + \
+                               perturbation_size * target_weights
+            
+            # Evaluate
+            encoder_i = AggregatedEncoder(
+                model_name=model_name,
+                pooling=pooling,
+                batch_size=batch_size,
+                device=device,
+                aggregation_weights=perturbed_weights,
+                use_cache=use_emb_cache,
+                cache_dir=emb_cache_dir
+            )
+            
+            prediction_dir_i = os.path.join(prediction_base_dir, f"layer_{i}")
+            os.makedirs(prediction_dir_i, exist_ok=True)
+            
+            results_i = mteb.evaluate(
+                model=encoder_i,
+                tasks=[task],
+                encode_kwargs={"batch_size": batch_size},
+                prediction_folder=prediction_dir_i,
+                show_progress_bar=False,
+                overwrite_strategy="always"
+            )
+            
+            # Extract per-sample scores
+            per_sample_scores_i = load_per_sample_scores_from_predictions(
+                prediction_dir_i, task, task_name, val_name, dataset_to_use
+            )
+            
+            # if num_samples < num_samples_actual:
+            #     per_sample_scores_i = per_sample_scores_i[indices]
+            
+            # Normalize and take log
+            per_sample_probs_i = per_sample_scores_i #/ per_sample_scores_i.sum()
+            per_sample_log_L_i = np.log(np.maximum(per_sample_probs_i, 1e-10))
+            
+            # Per-sample gradient for dimension i
+            print(per_sample_log_L_i)
+            gradient_i = (per_sample_log_L_i - per_sample_log_L_center) / perturbation_size
+            per_sample_gradients.append(gradient_i)
+            
+            if verbose >= 1:
+                mean_grad = gradient_i.mean()
+                std_grad = gradient_i.std()
+                print(f"mean={mean_grad:+.10f}, std={std_grad:.10f}, non-zero: {(gradient_i != 0).mean()}")
+                print(gradient_i)
+        
+        # Restore logging
+        for logger_name, level in original_levels.items():
+            logging.getLogger(logger_name).setLevel(level)
+    
+    # Step 3: Compute Fisher Information Matrix
+    # Shape: (n_layers, num_samples)
+    per_sample_gradients = np.array(per_sample_gradients)
+    
+    if verbose >= 1:
+        print(f"\n3. Computing Fisher Information Matrix:")
+        print(f"   Per-sample gradients shape: {per_sample_gradients.shape}")
+    
+    # Linear coefficient: average gradient across samples
+    coeff = per_sample_gradients.sum(axis=1)  # Shape: (n_layers,) #avoid normalization
+    print(coeff)
+    # Fisher = Covariance of gradients across samples
+    # F_ij = Cov[∂log L(x)/∂w_i, ∂log L(x)/∂w_j]
+    F = np.cov(per_sample_gradients)  # Shape: (n_layers, n_layers)
+    print(F)
+    # Hessian for maximization: H = -F
+    H = -F
+    
+    # Ensure symmetry
+    H = (H + H.T) / 2
+    
+    # Diagnostics
+    eigenvalues_F = np.linalg.eigvals(F)
+    eigenvalues_H = np.linalg.eigvals(H)
+    
+    if verbose >= 1:
+        print(f"\n{'='*70}")
+        print(f"Fisher Information Matrix Results:")
+        print(f"{'='*70}")
+        print(f"  Average log-likelihood: {c:.6f}")
+        print(f"  Linear coefficient (coeff) norm: {np.linalg.norm(coeff):.6f}")
+        print(f"  Linear coefficient range: [{coeff.min():.6f}, {coeff.max():.6f}]")
+        print(f"\nFisher Matrix F:")
+        print(f"  F diagonal: {np.diag(F)}")
+        print(f"  F eigenvalue range: [{eigenvalues_F.min():.6f}, {eigenvalues_F.max():.6f}]")
+        print(f"  F trace: {np.trace(F):.6f}")
+        print(f"\nHessian H = -F:")
+        print(f"  H diagonal: {np.diag(H)}")
+        print(f"  H eigenvalue range: [{eigenvalues_H.min():.6f}, {eigenvalues_H.max():.6f}]")
+        
+        if np.all(eigenvalues_H < 1e-6):
+            print(f"  ✓ Hessian is negative definite (local maximum)")
+        elif np.all(eigenvalues_H > -1e-6):
+            print(f"  ⚠ Hessian is positive definite (local minimum)")
+        else:
+            print(f"  ⚠ Hessian is indefinite (saddle point)")
+        print(f"{'='*70}\n")
+    
+    # Cache
+    cache_data = {
+        'c': c,
+        'coeff': coeff,
+        'hessian': H,
+        'fisher': F,
+        'per_sample_gradients': per_sample_gradients,
+        'best_layer_idx': best_layer_idx,
+        'num_samples': num_samples,
+        'perturbation_size': perturbation_size,
+        'method': 'fisher_per_sample',
+        'task_name': task_name,
+        'model_name': model_name,
+        'pooling': pooling
+    }
+    
+    with open(hessian_cache_path, 'wb') as f:
+        pickle.dump(cache_data, f)
+    
+    if verbose >= 1:
+        print(f"✓ Cached Fisher-Hessian to {hessian_cache_path}\n")
+    
+    return center_weights, coeff, H
+
+
+def load_per_sample_scores_from_predictions(
+    prediction_dir: str,
+    task_resolver
+) -> np.ndarray:
+    """
+    Load per-sample scores from MTEB prediction files.
+    Returns array of per-sample scores. NO FALLBACK SCORES - raises errors!
+    """
+    import json
+    from pathlib import Path
+    
+    # Find prediction file
+    pred_dir_path = Path(prediction_dir)
+    if not pred_dir_path.exists():
+        raise FileNotFoundError(f"Prediction directory not found: {prediction_dir}")
+    
+    pred_files = list(pred_dir_path.glob("*.json"))
+    if not pred_files:
+        raise FileNotFoundError(f"No prediction files in {prediction_dir}")
+    
+    pred_file = pred_files[0]
+    
+    with open(pred_file, 'r') as f:
+        pred_data = json.load(f)
+    
+    # All nesting logic delegated to resolver
+    split_predictions = task_resolver.unwrap_predictions(pred_data)
+
+    if isinstance(split_predictions, list) and split_predictions and isinstance(split_predictions[0], list):
+        split_predictions = split_predictions[0]
+
+    val_data = task_resolver.dataset.get(task_resolver.val_name)
+    if val_data is None:
+        raise ValueError(f"Validation split '{task_resolver.val_name}' not found in dataset")
+    
+    # Extract per-sample scores based on task type
+    if task_resolver.task_type == "Classification":
+        # Per-sample correctness
+        if 'label' in val_data.column_names:
+            true_labels = list(val_data['label'])
+        elif 'labels' in val_data.column_names:
+            true_labels = list(val_data['labels'])
+        else:
+            raise ValueError(f"No label column. Available: {val_data.column_names}")
+        true_labels = list(true_labels)
+        if type(true_labels[0]) is list:
+            true_labels = true_labels[0]
+        print("split_predictions", split_predictions)
+        print("true_labels", true_labels)
+        # Predictions format check
+        if isinstance(split_predictions, dict):
+            pred_list = [split_predictions.get(str(i), split_predictions.get(i)) for i in range(len(true_labels))]
+            if None in pred_list:
+                raise ValueError(f"Missing predictions for some samples")
+        elif isinstance(split_predictions, list):
+            pred_list = split_predictions
+        else:
+            raise ValueError(f"Unexpected predictions format: {type(split_predictions)}")
+        
+        per_sample_scores = np.array([1.0 if pred == true else 0.0
+                                     for pred, true in zip(pred_list, true_labels)])
+    
+    elif task_resolver.task_type == "STS":
+        # Per-pair score based on prediction error
+        if 'score' not in val_data.column_names:
+            raise ValueError(f"No 'score' column. Available: {val_data.column_names}")
+        
+        true_scores = np.array(val_data['score'])
+        
+        if isinstance(split_predictions, list):
+            pred_scores = np.array(split_predictions)
+        elif isinstance(split_predictions, dict):
+            pred_scores = np.array([split_predictions[str(i)] if str(i) in split_predictions else split_predictions[i] 
+                                   for i in range(len(true_scores))])
+        else:
+            raise ValueError(f"Unexpected predictions format: {type(split_predictions)}")
+        
+        # Normalize to [0, 5] range (cosine similarity [-1,1] -> [0,5])
+        pred_scores_normalized = (pred_scores + 1) * 2.5
+        absolute_errors = np.abs(pred_scores_normalized - true_scores)
+        per_sample_scores = np.maximum(1.0 - (absolute_errors / 5.0), 0.0)
+    
+    elif task_resolver.task_type == "Retrieval":
+        # Per-query binary relevance or NDCG
+        if 'queries' not in val_data:
+            raise ValueError("No 'queries' in validation data")
+        
+        queries = val_data['queries']
+        qrels = val_data.get('qrels') or val_data.get('relevant_docs')
+        if qrels is None:
+            raise ValueError("No 'qrels' or 'relevant_docs' in validation data")
+        
+        if isinstance(queries, dict):
+            query_ids = list(queries.keys())
+        else:
+            raise ValueError(f"Unexpected queries format: {type(queries)}")
+        
+        # split_predictions should be dict of {query_id: {doc_id: score}}
+        if not isinstance(split_predictions, dict):
+            raise ValueError(f"Expected dict for retrieval predictions, got {type(split_predictions)}")
+        
+        per_sample_scores = []
+        for qid in query_ids:
+            qid_str = str(qid)
+            
+            if qid_str not in split_predictions:
+                raise ValueError(f"Query {qid_str} not in predictions")
+            if qid_str not in qrels:
+                raise ValueError(f"Query {qid_str} not in qrels")
+            
+            # Get top-10 retrieved docs
+            if isinstance(split_predictions[qid_str], dict):
+                # Sort by score descending
+                retrieved_docs = sorted(split_predictions[qid_str].items(), 
+                                       key=lambda x: x[1], reverse=True)[:10]
+                retrieved_doc_ids = [doc_id for doc_id, _ in retrieved_docs]
+            elif isinstance(split_predictions[qid_str], list):
+                retrieved_doc_ids = split_predictions[qid_str][:10]
+            else:
+                raise ValueError(f"Unexpected predictions format for query {qid_str}")
+            
+            if isinstance(qrels[qid_str], dict):
+                relevant_docs = set(qrels[qid_str].keys())
+            elif isinstance(qrels[qid_str], list):
+                relevant_docs = set(qrels[qid_str])
+            else:
+                raise ValueError(f"Unexpected qrels format for query {qid_str}")
+            
+            # Binary: any relevant in top-10?
+            has_relevant = any(doc_id in relevant_docs for doc_id in retrieved_doc_ids)
+            per_sample_scores.append(1.0 if has_relevant else 0.0)
+        
+        per_sample_scores = np.array(per_sample_scores)
+    
+    elif task_resolver.task_type == "PairClassification":
+        # Per-pair correctness
+        if 'label' not in val_data.column_names:
+            raise ValueError(f"No 'label' column. Available: {val_data.column_names}")
+        
+        true_labels = val_data['label']
+        
+        if isinstance(split_predictions, dict):
+            pred_list = [split_predictions[str(i)] if str(i) in split_predictions else split_predictions[i] 
+                        for i in range(len(true_labels))]
+        elif isinstance(split_predictions, list):
+            pred_list = split_predictions
+        else:
+            raise ValueError(f"Unexpected predictions format: {type(split_predictions)}")
+        
+        per_sample_scores = np.array([1.0 if pred == true else 0.0 
+                                     for pred, true in zip(pred_list, true_labels)])
+    
+    elif task_resolver.task_type == "Clustering":
+        # Per-sample cluster purity
+        if 'label' not in val_data.column_names:
+            raise ValueError(f"No 'label' column for clustering")
+        
+        true_labels = np.array(val_data['label'])
+        
+        if isinstance(split_predictions, list):
+            pred_clusters = np.array(split_predictions)
+        elif isinstance(split_predictions, dict):
+            pred_clusters = np.array([split_predictions[str(i)] if str(i) in split_predictions else split_predictions[i] 
+                                     for i in range(len(true_labels))])
+        else:
+            raise ValueError(f"Unexpected predictions format: {type(split_predictions)}")
+        
+        per_sample_scores = []
+        for i, (pred_cluster, true_label) in enumerate(zip(pred_clusters, true_labels)):
+            same_cluster_mask = (pred_clusters == pred_cluster)
+            same_cluster_true_labels = true_labels[same_cluster_mask]
+            
+            if len(same_cluster_true_labels) > 0:
+                purity = np.sum(same_cluster_true_labels == true_label) / len(same_cluster_true_labels)
+            else:
+                purity = 0.0
+            
+            per_sample_scores.append(max(purity, 0.01))
+        
+        per_sample_scores = np.array(per_sample_scores)
+    
+    elif task_resolver.task_type == "Reranking":
+        # Similar to retrieval
+        if 'queries' not in val_data:
+            raise ValueError("No 'queries' in validation data")
+        
+        queries = val_data['queries']
+        qrels = val_data.get('qrels') or val_data.get('relevant_docs')
+        if qrels is None:
+            raise ValueError("No 'qrels' in validation data")
+        
+        if not isinstance(split_predictions, dict):
+            raise ValueError(f"Expected dict for reranking predictions")
+        
+        query_ids = list(queries.keys()) if isinstance(queries, dict) else queries
+        
+        per_sample_scores = []
+        for qid in query_ids:
+            qid_str = str(qid)
+            
+            if qid_str not in split_predictions or qid_str not in qrels:
+                raise ValueError(f"Query {qid_str} missing from predictions or qrels")
+            
+            # Binary relevance
+            if isinstance(split_predictions[qid_str], dict):
+                retrieved_docs = sorted(split_predictions[qid_str].items(), 
+                                       key=lambda x: x[1], reverse=True)[:10]
+                retrieved_doc_ids = [doc_id for doc_id, _ in retrieved_docs]
+            else:
+                retrieved_doc_ids = split_predictions[qid_str][:10]
+            
+            relevant_docs = set(qrels[qid_str].keys() if isinstance(qrels[qid_str], dict) else qrels[qid_str])
+            
+            has_relevant = any(doc_id in relevant_docs for doc_id in retrieved_doc_ids)
+            per_sample_scores.append(1.0 if has_relevant else 0.01)
+        
+        per_sample_scores = np.array(per_sample_scores)
+    
+    else:
+        raise ValueError(f"Unsupported task type: {task_resolver.task_type}")
+    
+    if len(per_sample_scores) == 0:
+        raise ValueError("No per-sample scores were computed!")
+    
+    return per_sample_scores
