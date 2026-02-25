@@ -114,7 +114,8 @@ CORE_MTEB_TASKS = {
     "NFCorpus", "SciFact", "FiQA2018", 
     #"QuoraRetrieval",#too big
     # Classification (4)
-    "Banking77Classification", "AmazonCounterfactualClassification","EmotionClassification",
+    "Banking77Classification", 
+    "AmazonCounterfactualClassification","EmotionClassification",
     # STS (1)
     "STSBenchmark", #"SICK-R",
     # Pair Classification (1)
@@ -298,6 +299,7 @@ def compute_method_weights(
     method: str,
     similarity_matrix: np.ndarray,
     layer_quality: np.ndarray,
+    center_weights,
     lmbd: float,
     normalize_layer_quality=False,
     softmax_temperature: float = 1.0,
@@ -318,7 +320,14 @@ def compute_method_weights(
         layer_quality = layer_quality / layer_quality.sum()
     
     if method == "weighted":
-        weights = compute_similarity_weights(similarity_matrix, layer_quality, lmbd)
+        constraint = 1.0 if (center_weights is None) else 0.0
+        nonnegative_ids = (center_weights == 0) if not (center_weights is None) else None
+        nonnegative = (constraint > 0)
+        weights = compute_similarity_weights(similarity_matrix, layer_quality, lmbd, 
+        nonnegative=nonnegative, 
+        constraint=constraint,
+        nonnegative_ids=nonnegative_ids)
+
     elif method == 'weighted_greedy':
         weights = compute_similarity_weights_greedy(similarity_matrix, layer_quality, lmbd)
     elif method == "greedy_rank":
@@ -349,6 +358,11 @@ def compute_method_weights(
     else:
         raise ValueError(f"Unknown method: {method}")
     
+    if not(center_weights is None):
+        print(center_weights, weights)
+        weights = center_weights + weights
+        weights /= weights.sum()
+        print(weights)
     return weights
 
 
@@ -357,6 +371,7 @@ def create_aggregated_encoder(
     similarity_matrix: np.ndarray,
     method: str,
     layer_quality: np.ndarray,
+    center_weights,
     lmbd: float,
     normalize_layer_quality=False,
     softmax_temperature: float = 1.0,
@@ -374,14 +389,15 @@ def create_aggregated_encoder(
 ):
     """Create encoder with method-specific weights or PCA."""
     # Transform similarity matrix
-    similarity_matrix = transform_similarity_matrix(
-        similarity_matrix, use_arccos_similarity, use_log_similarity, add_row_sum_to_diag
-    )
+    if not (similarity_matrix is None):
+        similarity_matrix = transform_similarity_matrix(
+            similarity_matrix, use_arccos_similarity, use_log_similarity, add_row_sum_to_diag
+        )
     
     if method in ["weighted", 'weighted_greedy', "greedy_rank", "greedy_val",
                   "greedy_delta", "cluster", "mean", "last", "best", "weighted_best"]:
         weights = compute_method_weights(
-            method, similarity_matrix, layer_quality, lmbd, 
+            method, similarity_matrix, layer_quality, center_weights, lmbd, 
             normalize_layer_quality, softmax_temperature, use_softmax, use_log_quality, num_clusters
         )
         encoder = AggregatedEncoder(
@@ -517,41 +533,41 @@ def save_intermediate_results(output_dir: str, config_name: str, results: Dict[s
 
 def extract_main_score(task_result: Dict[str, Any], task_name: str) -> float:
     """Extract the main evaluation score from a task result."""
-    try:
-        if task_result is None:
-            return None
-
-        scores = task_result.get('scores', {})
-        if not scores:
-            return None
-
-        # Get the first split (usually 'test' or 'validation')
-        split_name = list(scores.keys())[0]
-        split_scores = scores[split_name]
-
-        # Handle list format (MTEB returns list with one element)
-        if isinstance(split_scores, list) and len(split_scores) > 0:
-            split_scores = split_scores[0]
-
-        # Return main_score if present
-        if 'main_score' in split_scores:
-            return split_scores['main_score']
-
-        # Fallback to common metric names
-        for metric in ['cosine_spearman', 'ndcg_at_10', 'accuracy', 
-                       'v_measure', 'ap', 'cosine_pearson', 'map']:
-            if metric in split_scores:
-                return split_scores[metric]
-
-        # If no known metric, return the first numeric value
-        for key, value in split_scores.items():
-            if isinstance(value, (int, float)) and key not in ['hf_subset', 'languages']:
-                return value
-
+    #try:
+    if task_result is None:
         return None
-    except Exception as e:
-        logger.debug(f"Could not extract score for {task_name}: {e}")
+
+    scores = task_result.get('scores', {})
+    if not scores:
         return None
+
+    # Get the first split (usually 'test' or 'validation')
+    split_name = list(scores.keys())[0]
+    split_scores = scores[split_name]
+
+    # Handle list format (MTEB returns list with one element)
+    if isinstance(split_scores, list) and len(split_scores) > 0:
+        split_scores = split_scores[0]
+
+    # Return main_score if present
+    if 'main_score' in split_scores:
+        return split_scores['main_score']
+
+    # Fallback to common metric names
+    for metric in ['cosine_spearman', 'ndcg_at_10', 'accuracy', 
+                    'v_measure', 'ap', 'cosine_pearson', 'map']:
+        if metric in split_scores:
+            return split_scores[metric]
+
+    # If no known metric, return the first numeric value
+    for key, value in split_scores.items():
+        if isinstance(value, (int, float)) and key not in ['hf_subset', 'languages']:
+            return value
+
+    return None
+    # except Exception as e:
+    #     logger.debug(f"Could not extract score for {task_name}: {e}")
+    #     return None
 
 
 def update_results_tables(output_dir: str, config_name: str, task_name: str, main_score):
@@ -694,12 +710,16 @@ def run_evaluation(
     per_dataset_similarity_metric: Optional[str] = None,
     similarity_sample_size: int = 3000,
     similarity_num_trials: int = 5,
-    similarity_cache_dir: str = "./similarity_cache"
+    similarity_cache_dir: str = "./similarity_cache",
+    per_dataset_hessian: bool = False,
+    hessian_cache_dir: str = "./hessian_cache"
 ):
     """Run MTEB evaluation for all method/lambda combinations."""
-    if per_dataset_similarity_metric is None:
-        similarity_matrix = load_similarity_matrix(similarity_matrix_path)
-        print(similarity_matrix)
+    matrix_to_use = None
+    # if not per_dataset_similarity_metric and not per_dataset_hessian:
+    #     similarity_matrix = load_similarity_matrix(similarity_matrix_path)
+    #     matrix_to_use = similarity_matrix
+    #     print(similarity_matrix)
     os.makedirs(output_dir, exist_ok=True)
 
     logger.info("Loading MTEB tasks...")
@@ -749,6 +769,8 @@ def run_evaluation(
         for lmbd in lambda_to_iter:
             #normalize_to_iter = lambda_values is method in methods_with_lambda else [1.0]
             config_name = f"{method}_lambda{lmbd}_norm{normalize_layer_quality}"
+            if per_dataset_hessian:
+                config_name += "_perdataset_hessian"
             if per_dataset_similarity_metric:
                 config_name += f"_perdataset_{per_dataset_similarity_metric}"
             if use_softmax:
@@ -766,114 +788,162 @@ def run_evaluation(
             logger.info(f"Evaluating: {config_name}")
             logger.info("=" * 70)
 
-            try:
-                config_results = {
-                    'method': method,
-                    'lambda': lmbd,
-                    'normalize': normalize_layer_quality, 
-                    'task_results': {}
+            #try:
+            config_results = {
+                'method': method,
+                'lambda': lmbd,
+                'normalize': normalize_layer_quality, 
+                'task_results': {}
+            }
+
+            for task in all_tasks:
+                task_name = task.metadata.name
+                logger.info(f"\n>>> Running task: {task_name}")
+                
+                if max_samples is not None:
+                    res = filter_by_sample_count([task], max_samples)
+                    if not res:
+                        continue
+
+                #try:
+                task_to_use = task_name if (dataset_specific_task is None) else dataset_specific_task
+                logger.info(f"Computing layer quality on {task_to_use}...")
+                center_weights = None
+                gradient_descent = True
+                if gradient_descent:
+                    layer_quality = compute_dataset_specific_layer_quality(
+                        model_name=model_name,
+                        task_name=task_to_use,
+                        pooling=pooling,
+                        batch_size=batch_size,
+                        device="cuda",
+                        verbose=1,
+                        use_cache=use_quality_cache,
+                        cache_dir=quality_cache_dir,
+                        use_emb_cache=use_embedding_cache,
+                        emb_cache_dir=embedding_cache_dir,
+                        calc_similarity_matrix=False,
+                        similarity_metric=per_dataset_similarity_metric,
+                        similarity_sample_size=similarity_sample_size,
+                        similarity_num_trials=similarity_num_trials,
+                        similarity_cache_dir=similarity_cache_dir,
+                        calc_hessian_matrix=False,
+                        hessian_cache_dir=hessian_cache_dir,
+                        gradient_descent=True
+                        )
+                    method='weighted_best'
+                elif per_dataset_hessian:
+                    print(1)
+                    center_weights, layer_quality, matrix_to_use = compute_dataset_specific_layer_quality(
+                        model_name=model_name,
+                        task_name=task_to_use,
+                        pooling=pooling,
+                        batch_size=batch_size,
+                        device="cuda",
+                        verbose=1,
+                        use_cache=use_quality_cache,
+                        cache_dir=quality_cache_dir,
+                        use_emb_cache=use_embedding_cache,
+                        emb_cache_dir=embedding_cache_dir,
+                        calc_similarity_matrix=False,
+                        similarity_metric=per_dataset_similarity_metric,
+                        similarity_sample_size=similarity_sample_size,
+                        similarity_num_trials=similarity_num_trials,
+                        similarity_cache_dir=similarity_cache_dir,
+                        calc_hessian_matrix=True,
+                        hessian_cache_dir=hessian_cache_dir
+                        )
+                    logger.info(f"Using per-dataset Hessian matrix: {matrix_to_use.shape}")
+                elif per_dataset_similarity_metric:
+                    print(2)
+                    layer_quality, matrix_to_use = compute_dataset_specific_layer_quality(
+                        model_name=model_name,
+                        task_name=task_to_use,
+                        pooling=pooling,
+                        batch_size=batch_size,
+                        device="cuda",
+                        verbose=1,
+                        use_cache=use_quality_cache,
+                        cache_dir=quality_cache_dir,
+                        use_emb_cache=use_embedding_cache,
+                        emb_cache_dir=embedding_cache_dir,
+                        calc_similarity_matrix=True,
+                        similarity_metric=per_dataset_similarity_metric,
+                        similarity_sample_size=similarity_sample_size,
+                        similarity_num_trials=similarity_num_trials,
+                        similarity_cache_dir=similarity_cache_dir
+                    )
+                else:
+                    layer_quality = compute_dataset_specific_layer_quality(
+                        model_name=model_name,
+                        task_name=task_to_use,
+                        pooling=pooling,
+                        batch_size=batch_size,
+                        device="cuda",
+                        verbose=1,
+                        use_cache=use_quality_cache,
+                        cache_dir=quality_cache_dir,
+                        use_emb_cache=use_embedding_cache,
+                        emb_cache_dir=embedding_cache_dir
+                    )
+                    matrix_to_use = similarity_matrix
+
+                print(layer_quality)
+                print(matrix_to_use)
+                encoder = create_aggregated_encoder(
+                    similarity_matrix=matrix_to_use,  # Can be similarity OR Hessian
+                    model_name=model_name,
+                    method=method,
+                    layer_quality=layer_quality,
+                    center_weights=center_weights,
+                    lmbd=lmbd,
+                    normalize_layer_quality=normalize_layer_quality,
+                    softmax_temperature=softmax_temperature,
+                    use_softmax=use_softmax,
+                    use_log_quality=use_log_quality,
+                    use_arccos_similarity=use_arccos_similarity,
+                    use_log_similarity=use_log_similarity,
+                    add_row_sum_to_diag=add_row_sum_to_diag,
+                    batch_size=batch_size,
+                    pca_cache_dir=pca_cache_dir,
+                    pooling=pooling,
+                    num_clusters=num_clusters,
+                    use_cache=use_embedding_cache,
+                    cache_dir=embedding_cache_dir
+                )
+
+                task_result = mteb.evaluate(
+                    model=encoder,
+                    tasks=[task],
+                    encode_kwargs={"batch_size": batch_size},
+                    show_progress_bar=True,
+                    overwrite_strategy="always"  #'only-missing'
+                )
+                score = extract_main_score(task_result[0].to_dict(), task_name)
+                config_results['task_results'][task_name] = {
+                    'status': 'completed',
+                    'result': score
                 }
 
-                for task in all_tasks:
-                    task_name = task.metadata.name
-                    logger.info(f"\n>>> Running task: {task_name}")
-                    
-                    if max_samples is not None:
-                        res = filter_by_sample_count([task], max_samples)
-                        if not res:
-                            continue
+                save_intermediate_results(output_dir, config_name, config_results)
+                update_results_tables(output_dir, config_name, task_name, score)
+                logger.info(f"✓ Completed {task_name}")
 
-                    try:
-                        task_to_use = task_name if (dataset_specific_task is None) else dataset_specific_task
-                        logger.info(f"Computing layer quality on {task_to_use}...")
-                        if per_dataset_similarity_metric:
-                            layer_quality, similarity_matrix_to_use = compute_dataset_specific_layer_quality(
-                                model_name=model_name,
-                                task_name=task_to_use,
-                                pooling=pooling,
-                                batch_size=batch_size,
-                                device="cuda",
-                                verbose=1,
-                                use_cache=use_quality_cache,
-                                cache_dir=quality_cache_dir,
-                                use_emb_cache=use_embedding_cache,
-                                emb_cache_dir=embedding_cache_dir,
-                                calc_similarity_matrix=True,
-                                similarity_metric=per_dataset_similarity_metric,
-                                similarity_sample_size=similarity_sample_size,
-                                similarity_num_trials=similarity_num_trials,
-                                similarity_cache_dir=similarity_cache_dir
-                            )
-                        else:
-                            layer_quality = compute_dataset_specific_layer_quality(
-                                model_name=model_name,
-                                task_name=task_to_use,
-                                pooling=pooling,
-                                batch_size=batch_size,
-                                device="cuda",
-                                verbose=1,
-                                use_cache=use_quality_cache,
-                                cache_dir=quality_cache_dir,
-                                use_emb_cache=use_embedding_cache,
-                                emb_cache_dir=embedding_cache_dir
-                            )
-                            similarity_matrix_to_use = similarity_matrix
+                # except Exception as task_error:
+                #     logger.error(f"✗ Failed {task_name}: {task_error}")
+                #     config_results['task_results'][task_name] = {
+                #         'status': 'failed',
+                #         'error': str(task_error)
+                #     }
+                #     save_intermediate_results(output_dir, config_name, config_results)
+                #     #update_results_tables(output_dir, config_name, task_name, score)
 
-                        print(layer_quality)
-                        print(similarity_matrix_to_use)
-                        encoder = create_aggregated_encoder(
-                            model_name=model_name,
-                            similarity_matrix=similarity_matrix_to_use,  # Use the right matrix
-                            method=method,
-                            layer_quality=layer_quality,
-                            lmbd=lmbd,
-                            normalize_layer_quality=normalize_layer_quality,
-                            softmax_temperature=softmax_temperature,
-                            use_softmax=use_softmax,
-                            use_log_quality=use_log_quality,
-                            use_arccos_similarity=use_arccos_similarity,
-                            use_log_similarity=use_log_similarity,
-                            add_row_sum_to_diag=add_row_sum_to_diag,
-                            batch_size=batch_size,
-                            pca_cache_dir=pca_cache_dir,
-                            pooling=pooling,
-                            num_clusters=num_clusters,
-                            use_cache=use_embedding_cache,
-                            cache_dir=embedding_cache_dir
-                        )
+            results[config_name] = config_results
+            logger.info(f"✓ Completed {config_name}")
 
-                        task_result = mteb.evaluate(
-                            model=encoder,
-                            tasks=[task],
-                            encode_kwargs={"batch_size": batch_size},
-                            show_progress_bar=True,
-                            overwrite_strategy="always"  #'only-missing'
-                        )
-                        score = extract_main_score(task_result[0].to_dict(), task_name)
-                        config_results['task_results'][task_name] = {
-                            'status': 'completed',
-                            'result': score
-                        }
-
-                        save_intermediate_results(output_dir, config_name, config_results)
-                        update_results_tables(output_dir, config_name, task_name, score)
-                        logger.info(f"✓ Completed {task_name}")
-
-                    except Exception as task_error:
-                        logger.error(f"✗ Failed {task_name}: {task_error}")
-                        config_results['task_results'][task_name] = {
-                            'status': 'failed',
-                            'error': str(task_error)
-                        }
-                        save_intermediate_results(output_dir, config_name, config_results)
-                        #update_results_tables(output_dir, config_name, task_name, score)
-
-                results[config_name] = config_results
-                logger.info(f"✓ Completed {config_name}")
-
-            except Exception as e:
-                logger.error(f"✗ Failed {config_name}: {e}", exc_info=True)
-                results[config_name] = {'error': str(e)}
+            # except Exception as e:
+            #     logger.error(f"✗ Failed {config_name}: {e}", exc_info=True)
+            #     results[config_name] = {'error': str(e)}
 
     summary_path = f"{output_dir}/evaluation_summary.pkl"
     with open(summary_path, 'wb') as f:
@@ -942,6 +1012,9 @@ def main():
                         help="Number of Monte Carlo trials for similarity")
     parser.add_argument("--similarity-cache-dir", type=str, default="./similarity_cache",
                         help="Directory to cache per-dataset similarity matrices")
+    parser.add_argument("--per-dataset-hessian", action="store_true",
+                    help="Calculate Hessian matrix per dataset")
+    parser.add_argument("--hessian-cache-dir", type=str, default="./hessian_cache")
     args = parser.parse_args()
 
     run_evaluation(
@@ -973,7 +1046,9 @@ def main():
         per_dataset_similarity_metric=args.per_dataset_similarity_metric,
         similarity_sample_size=args.similarity_sample_size,
         similarity_num_trials=args.similarity_num_trials,
-        similarity_cache_dir=args.similarity_cache_dir
+        similarity_cache_dir=args.similarity_cache_dir,
+        per_dataset_hessian=args.per_dataset_hessian,
+        hessian_cache_dir=args.hessian_cache_dir
     )
 
 

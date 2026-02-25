@@ -11,7 +11,7 @@ from typing import Any, Optional, Dict, Union, List
 from torch.utils.data import DataLoader
 from mteb.models import EncoderProtocol  
 from transformers import AutoTokenizer, AutoModel
-from src.cache_manager import EmbeddingCache
+from src.cache_manager import LayerEmbeddingStore
 from src.strategies import normalize_weights
 from types import SimpleNamespace
 
@@ -79,7 +79,12 @@ class LayerEncoder:
         
         # Initialize cache
         if use_cache:
-            self.cache = EmbeddingCache(cache_dir)
+            self.cache = LayerEmbeddingStore(
+                cache_dir=cache_dir,
+                model_name=model_name,
+                batch_size=batch_size,
+                n_layers=self.num_layers,
+                pooling=pooling)#EmbeddingCache(cache_dir)
             print(f"✓ cache enabled for LayerEncoder")
         else:
             self.cache = None

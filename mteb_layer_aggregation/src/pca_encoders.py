@@ -6,7 +6,7 @@ from typing import List, Optional, Union, Dict
 from transformers import AutoTokenizer, AutoModel
 from mteb.models import EncoderProtocol
 from abc import ABC, abstractmethod
-from src.cache_manager import EmbeddingCache
+from src.cache_manager import SQLiteEmbeddingCache
 
 class CachedLayerEncoderBase(ABC):
     """
@@ -44,7 +44,7 @@ class CachedLayerEncoderBase(ABC):
         
         # Initialize cache
         if use_cache:
-            self.cache = EmbeddingCache(cache_dir)
+            self.cache = SQLiteEmbeddingCache(cache_dir)
         else:
             self.cache = None
     

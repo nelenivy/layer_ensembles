@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 from datasets import Dataset, DatasetDict
 import random
 from collections import defaultdict
-from src.cache_manager import QualityCache, EmbeddingCache
+from src.cache_manager import QualityCache, SQLiteEmbeddingCache, LayerEmbeddingStore
 from src.metrics.calculator import SimilarityCalculator, AVAILABLE_METRICS
 from collections.abc import Iterable
 from datasets.features.features import Value  # HuggingFace column types
@@ -20,7 +20,10 @@ from src.aggregated_encoder import AggregatedEncoder
 from types import SimpleNamespace
 import json
 from pathlib import Path  
-from src.fisher_constrained_optimization import fisher_gradient_descent_trust_region_efficient
+from src.fisher_constrained_optimization import \
+     fisher_gradient_descent_trust_region_efficient, \
+        fisher_gradient_descent_null_space_efficient, \
+            fisher_gradient_descent_first_order
 from src.validation_split_resolver import ValidationSplitResolver
 
 def split_retrieval_data(queries, corpus, qrels, val_size=0.2, seed=42, qrels_key='qrels'):
@@ -85,7 +88,7 @@ class SingleLayerEncoder(EncoderProtocol):
         self.model_name = model_name
         
         if use_cache:
-            self.embedding_cache = EmbeddingCache(cache_dir)
+            self.embedding_cache = SQLiteEmbeddingCache(cache_dir)
         else:
             self.embedding_cache = None
 
@@ -763,7 +766,8 @@ def compute_dataset_specific_layer_quality(
     
     # Calculate Hessian matrix if requested
     if gradient_descent:
-        weights, quality_hist, weight_hist = fisher_gradient_descent_trust_region_efficient(
+        weights, quality_hist, weight_hist = fisher_gradient_descent_null_space_efficient(
+        #fisher_gradient_descent_first_order( #fisher_gradient_descent_null_space_efficient( #fisher_gradient_descent_trust_region_efficient(
             model_name=model_name,
             dataset_resolver=resolver,
             n_layers=n_layers,
@@ -1657,7 +1661,8 @@ def load_per_sample_scores_from_predictions(
     val_data = task_resolver.dataset.get(task_resolver.val_name)
     if val_data is None:
         raise ValueError(f"Validation split '{task_resolver.val_name}' not found in dataset")
-    
+    print("split_predictions", len(split_predictions), split_predictions)
+
     # Extract per-sample scores based on task type
     if task_resolver.task_type == "Classification":
         # Per-sample correctness
@@ -1670,8 +1675,8 @@ def load_per_sample_scores_from_predictions(
         true_labels = list(true_labels)
         if type(true_labels[0]) is list:
             true_labels = true_labels[0]
-        print("split_predictions", split_predictions)
-        print("true_labels", true_labels)
+        
+        print("true_labels", len(true_labels), true_labels)
         # Predictions format check
         if isinstance(split_predictions, dict):
             pred_list = [split_predictions.get(str(i), split_predictions.get(i)) for i in range(len(true_labels))]
@@ -1681,30 +1686,77 @@ def load_per_sample_scores_from_predictions(
             pred_list = split_predictions
         else:
             raise ValueError(f"Unexpected predictions format: {type(split_predictions)}")
-        
-        per_sample_scores = np.array([1.0 if pred == true else 0.0
+        assert(len(pred_list) == len(true_labels))
+
+        per_sample_scores = np.array([0.9 if pred == true else 0.1
                                      for pred, true in zip(pred_list, true_labels)])
-    
+        
     elif task_resolver.task_type == "STS":
-        # Per-pair score based on prediction error
-        if 'score' not in val_data.column_names:
-            raise ValueError(f"No 'score' column. Available: {val_data.column_names}")
-        
-        true_scores = np.array(val_data['score'])
-        
+        # ── 1. Get true scores ───────────────────────────────────────────────
+        score_col = next(
+            (c for c in ["score", "scores", "label"] if c in val_data.column_names), None
+        )
+        if score_col is None:
+            raise ValueError(f"No score column. Available: {val_data.column_names}")
+        true_scores = np.array(val_data[score_col], dtype=float)
+
+        # ── 2. Extract predicted cosine scores ───────────────────────────────
         if isinstance(split_predictions, list):
-            pred_scores = np.array(split_predictions)
+            pred_scores = np.array(split_predictions, dtype=float)
+
         elif isinstance(split_predictions, dict):
-            pred_scores = np.array([split_predictions[str(i)] if str(i) in split_predictions else split_predictions[i] 
-                                   for i in range(len(true_scores))])
+            first_key = next(iter(split_predictions))
+
+            # New MTEB: {<fold_int>: {"cosine_scores": [...], "dot_scores": [...], ...}}
+            # e.g. {4: {"cosine_scores": [0.95, 0.87, ...], "manhattan_distances": [...], ...}}
+            if isinstance(first_key, (int, float)) and isinstance(split_predictions[first_key], dict):
+                inner = split_predictions[first_key]
+                metric_key = next(
+                    (k for k in ("cosine_scores", "similarity_scores", "dot_scores") if k in inner),
+                    next(iter(inner))
+                )
+                pred_scores = np.array(inner[metric_key], dtype=float)
+
+            # Flat metric-keyed: {"cosine_scores": [...], ...}
+            elif isinstance(first_key, str) and not first_key.isdigit():
+                metric_key = next(
+                    (k for k in ("cosine_scores", "similarity_scores", "dot_scores")
+                    if k in split_predictions),
+                    first_key
+                )
+                pred_scores = np.array(split_predictions[metric_key], dtype=float)
+
+            # Legacy integer-indexed: {"0": 0.85, ...} or {0: 0.85, ...}
+            else:
+                pred_scores = np.array([
+                    split_predictions[str(i)] if str(i) in split_predictions
+                    else split_predictions[i]
+                    for i in range(len(true_scores))
+                ], dtype=float)
+
         else:
-            raise ValueError(f"Unexpected predictions format: {type(split_predictions)}")
-        
-        # Normalize to [0, 5] range (cosine similarity [-1,1] -> [0,5])
-        pred_scores_normalized = (pred_scores + 1) * 2.5
-        absolute_errors = np.abs(pred_scores_normalized - true_scores)
-        per_sample_scores = np.maximum(1.0 - (absolute_errors / 5.0), 0.0)
-    
+            raise ValueError(
+                f"Unexpected STS predictions format: {type(split_predictions)}, "
+                f"value[:3]={str(split_predictions)[:200]}"
+            )
+
+        # ── 3. Compare predictions to true scores → per_sample_scores ────────
+        # cosine ∈ [0, 1]  →  STS scale [0, 5]  →  compare with true_scores
+        print('true scores', true_scores)
+        absolute_errors = np.abs(pred_scores - true_scores / 5.0)
+        print(absolute_errors)
+        from scipy.stats import rankdata
+
+        N = len(pred_scores)
+
+        ranks_pred = rankdata(pred_scores)   # 1..N
+        ranks_gold = rankdata(true_scores)   # 1..N
+        d = ranks_pred - ranks_gold          # ∈ [-(N-1), N-1]
+        # Normalize to [0, 1]: 0 = worst rank swap, 1 = perfect match
+        per_sample_scores = 1.0 - (d / (N - 1)) ** 2
+
+        #per_sample_scores = np.maximum(1.0 - absolute_errors, 0.0)
+        print(per_sample_scores)
     elif task_resolver.task_type == "Retrieval":
         # Per-query binary relevance or NDCG
         if 'queries' not in val_data:
@@ -1714,18 +1766,32 @@ def load_per_sample_scores_from_predictions(
         qrels = val_data.get('qrels') or val_data.get('relevant_docs')
         if qrels is None:
             raise ValueError("No 'qrels' or 'relevant_docs' in validation data")
-        
+        print(queries)
+
+        # Normalize queries: dict or HF Dataset → dict
         if isinstance(queries, dict):
-            query_ids = list(queries.keys())
+            queryids = list(queries.keys())
+        elif hasattr(queries, "column_names") and "id" in queries.column_names:
+            # Newer MTEB: queries is a HuggingFace Dataset with 'id' and 'text' columns
+            queryids = list(queries["id"])
+            # Normalize to dict so downstream code (queries[qid]) keeps working
+            queries = {row["id"]: row["text"] for row in queries}
         else:
             raise ValueError(f"Unexpected queries format: {type(queries)}")
+
+        # Normalize qrels: HF Dataset → dict  (same version bump may affect qrels)
+        if hasattr(qrels, "column_names") and "qid" in qrels.column_names:
+            normalized = {}
+            for row in qrels:
+                normalized.setdefault(str(row["qid"]), {})[str(row["docid"])] = row.get("relevance", 1)
+            qrels = normalized
         
         # split_predictions should be dict of {query_id: {doc_id: score}}
         if not isinstance(split_predictions, dict):
             raise ValueError(f"Expected dict for retrieval predictions, got {type(split_predictions)}")
         
         per_sample_scores = []
-        for qid in query_ids:
+        for qid in queryids:                          # ← was query_ids (typo)
             qid_str = str(qid)
             
             if qid_str not in split_predictions:
@@ -1758,23 +1824,64 @@ def load_per_sample_scores_from_predictions(
         per_sample_scores = np.array(per_sample_scores)
     
     elif task_resolver.task_type == "PairClassification":
-        # Per-pair correctness
-        if 'label' not in val_data.column_names:
-            raise ValueError(f"No 'label' column. Available: {val_data.column_names}")
-        
-        true_labels = val_data['label']
-        
-        if isinstance(split_predictions, dict):
-            pred_list = [split_predictions[str(i)] if str(i) in split_predictions else split_predictions[i] 
-                        for i in range(len(true_labels))]
-        elif isinstance(split_predictions, list):
-            pred_list = split_predictions
+        # Labels stored as list-of-lists (1 dataset row = N sentence pairs)
+        if 'label' in val_data.column_names:
+            raw_labels = val_data['label']
+        elif 'labels' in val_data.column_names:
+            raw_labels = val_data['labels']
         else:
-            raise ValueError(f"Unexpected predictions format: {type(split_predictions)}")
-        
-        per_sample_scores = np.array([1.0 if pred == true else 0.0 
-                                     for pred, true in zip(pred_list, true_labels)])
-    
+            raise ValueError(f"No 'label' column. Available: {val_data.column_names}")
+
+        # Flatten list-of-lists → flat list of 0/1
+        if raw_labels and isinstance(raw_labels[0], list):
+            true_labels = [l for sublist in raw_labels for l in sublist]
+        else:
+            true_labels = list(raw_labels)
+
+        if isinstance(split_predictions, dict):
+            metric_key = next(iter(split_predictions))       # e.g. "cosine_scores"
+            metric_data = split_predictions[metric_key]
+            print(f"PairClassification using metric: {metric_key}, type: {type(metric_data)}, len: {len(metric_data) if hasattr(metric_data, '__len__') else 'N/A'}")
+
+            # New MTEB format: metric_data is directly a flat list of scores
+            if isinstance(metric_data, list):
+                if metric_data and isinstance(metric_data[0], list):
+                    flat_scores = [s for sublist in metric_data for s in sublist]
+                else:
+                    flat_scores = metric_data
+
+            # Old format: {"scores": [[...]], "labels": [[...]]}
+            elif isinstance(metric_data, dict) and "scores" in metric_data:
+                raw_scores = metric_data["scores"]
+                if raw_scores and isinstance(raw_scores[0], list):
+                    flat_scores = [s for sublist in raw_scores for s in sublist]
+                else:
+                    flat_scores = list(raw_scores)
+
+            else:
+                raise ValueError(
+                    f"Unexpected PairClassification predictions format "
+                    f"under '{metric_key}': {type(metric_data)}, value[:3]={str(metric_data)[:200]}"
+                )
+
+        elif isinstance(split_predictions, list):
+            if split_predictions and isinstance(split_predictions[0], list):
+                flat_scores = [s for sublist in split_predictions for s in sublist]
+            else:
+                flat_scores = split_predictions
+        else:
+            raise ValueError(f"Unexpected predictions format for PairClassification: {type(split_predictions)}")
+
+        print(f"PairClassification: {len(flat_scores)} scores, {len(true_labels)} labels")
+
+        # Per-sample quality: cosine score ∈ [-1,1] → [0,1], agreement with label
+        flat_scores_norm = [(s + 1) / 2 for s in flat_scores]
+        per_sample_scores = np.array([
+            s if label == 1 else (1.0 - s)
+            for s, label in zip(flat_scores_norm, true_labels)
+        ])
+
+
     elif task_resolver.task_type == "Clustering":
         # Per-sample cluster purity
         if 'label' not in val_data.column_names:
@@ -1817,7 +1924,14 @@ def load_per_sample_scores_from_predictions(
         if not isinstance(split_predictions, dict):
             raise ValueError(f"Expected dict for reranking predictions")
         
-        query_ids = list(queries.keys()) if isinstance(queries, dict) else queries
+        # Normalize queries: dict or HF Dataset → dict  (mirrors Retrieval fix)
+        if isinstance(queries, dict):
+            query_ids = list(queries.keys())
+        elif hasattr(queries, "column_names") and "id" in queries.column_names:
+            query_ids = list(queries["id"])
+            queries = {row["id"]: row["text"] for row in queries}
+        else:
+            query_ids = queries                        # fallback: already iterable
         
         per_sample_scores = []
         for qid in query_ids:
